@@ -46,6 +46,10 @@ spec:
               name: http
               protocol: TCP
           env:
+{{- range .Values.app.extraEnv }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+{{- end }}
             # Application settings
             - name: GIN_MODE
               value: {{ .Values.app.env.GIN_MODE | quote }}
