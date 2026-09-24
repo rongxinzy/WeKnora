@@ -91,6 +91,10 @@ app:
 
   # -- Environment variables for the app container
   # Ref: https://github.com/Tencent/WeKnora/blob/main/docker-compose.yml
+  # -- Extra environment variables rendered verbatim into the app container
+  # (the fixed env list above only reads specific keys). Use for things like
+  # SSRF_WHITELIST_EXTRA when the app must call in-cluster gateways.
+  extraEnv: []
   env:
     GIN_MODE: release
     # -- Retrieval driver: postgres, elasticsearch_v7, elasticsearch_v8, qdrant
