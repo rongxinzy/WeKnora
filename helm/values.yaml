@@ -13,7 +13,7 @@
 global:
   # -- Storage class for all PersistentVolumeClaims
   # Set to "-" to use cluster default, or specify a storage class name
-  storageClass: ""
+  storageClass: "longhorn"   # cicd 2026-10-07：Longhorn 为默认存储（local-path 仅存量）
 
   # -- Image pull secrets for private registries
   # @default -- []
@@ -64,9 +64,9 @@ app:
 
   image:
     # -- Image repository
-    repository: wechatopenai/weknora-app
+    repository: harbor.zhiyuan.local:30443/zhiyuan/weknora-app
     # -- Image tag (defaults to Chart.appVersion if empty)
-    tag: ""
+    tag: "v0.8.0"
     # -- Image pull policy
     pullPolicy: IfNotPresent
 
@@ -162,7 +162,7 @@ frontend:
 
   image:
     # -- Image repository
-    repository: wechatopenai/weknora-ui
+    repository: harbor.zhiyuan.local:30443/zhiyuan/weknora-ui
     # -- Image tag
     tag: latest
     # -- Image pull policy
@@ -209,7 +209,7 @@ docreader:
 
   image:
     # -- Image repository
-    repository: wechatopenai/weknora-docreader
+    repository: harbor.zhiyuan.local:30443/zhiyuan/weknora-docreader
     # -- Image tag
     tag: latest
     # -- Image pull policy
@@ -256,7 +256,7 @@ postgresql:
 
   image:
     # -- Image repository (ParadeDB for vector search)
-    repository: paradedb/paradedb
+    repository: harbor.zhiyuan.local:30443/zhiyuan/paradedb
     # -- Image tag
     tag: v0.18.9-pg17
 
@@ -282,7 +282,7 @@ postgresql:
     # -- Size of the PVC
     size: 10Gi
     # -- Use existing PVC (leave empty to create new)
-    existingClaim: ""
+    existingClaim: "weknora-postgres-lh"   # 2026-10-07 迁 Longhorn
 
   # -- Node selector
   nodeSelector: {}
@@ -328,7 +328,7 @@ redis:
     # -- Size of the PVC
     size: 1Gi
     # -- Use existing PVC (leave empty to create new)
-    existingClaim: ""
+    existingClaim: "weknora-redis-lh"   # 2026-10-07 迁 Longhorn
 
   # -- Node selector
   nodeSelector: {}
@@ -349,7 +349,7 @@ dataFiles:
     # -- Size of the PVC
     size: 10Gi
     # -- Use existing PVC (leave empty to create new)
-    existingClaim: ""
+    existingClaim: "weknora-data-files-lh"   # 2026-10-07 迁 Longhorn
 
 # -----------------------------------------------------------------------------
 # Ingress Configuration
