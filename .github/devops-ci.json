@@ -1,4 +1,10 @@
 {
+  "optionalWorkflows": [
+    {
+      "path": ".github/workflows/cli-e2e.yml",
+      "reason": "Requires an acceptance label and real service credentials; run explicitly for integration acceptance."
+    }
+  ],
   "workflows": [
     {
       "name": "Anydoc",
