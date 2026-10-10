@@ -7,14 +7,17 @@ A Model Context Protocol server that provides access to the WeKnora knowledge ma
 
 import argparse
 import asyncio
+from contextlib import contextmanager
 import functools
 import json
 import logging
+import math
 import os
 import re
 import secrets
 import sys
 import threading
+import urllib.parse
 from typing import Any, Dict
 
 import urllib3
@@ -40,6 +43,28 @@ except ValueError:
 # Network transport defaults kept for backward compatibility with pre-2.x deployments.
 SSE_MESSAGE_PATH = "/sse/messages/"
 STREAMABLE_HTTP_STATELESS = True
+PORTAL_KNOWLEDGE_AUTH_URL = os.getenv("PORTAL_KNOWLEDGE_AUTH_URL", "").strip().rstrip("/")
+PORTAL_KNOWLEDGE_AUTH_REQUIRED = os.getenv("PORTAL_KNOWLEDGE_AUTH_REQUIRED", "false").strip().lower() == "true"
+_EMPLOYEE_NAME_RE = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$", re.ASCII)
+_OPAQUE_CONTEXT_RE = re.compile(r"^[A-Za-z0-9_-]{43}$", re.ASCII)
+
+
+def _validate_read_pagination(page: int, page_size: int) -> None:
+    """Match WeKnora's tenant-scoped list query limits before issuing reads."""
+    if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+        raise ValueError("page must be a positive integer")
+    if isinstance(page_size, bool) or not isinstance(page_size, int) or not 1 <= page_size <= 100:
+        raise ValueError("page_size must be between 1 and 100")
+
+
+def _validate_hybrid_search(query: str, vector_threshold: float, keyword_threshold: float, match_count: int) -> None:
+    if not isinstance(query, str) or not query.strip() or len(query) > 4000:
+        raise ValueError("query must contain 1 to 4000 characters")
+    for name, value in (("vector_threshold", vector_threshold), ("keyword_threshold", keyword_threshold)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError(f"{name} must be between 0 and 1")
+    if isinstance(match_count, bool) or not isinstance(match_count, int) or not 1 <= match_count <= 100:
+        raise ValueError("match_count must be between 1 and 100")
 
 
 def network_transport_auth_token() -> str:
@@ -126,10 +151,11 @@ def _normalize_kb_entries(resp: object) -> list[Dict]:
 class WeKnoraClient:
     """Client for interacting with WeKnora API"""
 
-    def __init__(self, base_url: str, api_key: str):
+    def __init__(self, base_url: str, api_key: str, portal_knowledge_auth_url: str | None = None):
         """Initialize the WeKnora API client with base URL and authentication"""
         self.base_url = base_url
         self.api_key = api_key
+        self.portal_knowledge_auth_url = (PORTAL_KNOWLEDGE_AUTH_URL if portal_knowledge_auth_url is None else portal_knowledge_auth_url).strip().rstrip("/")
         # SSL verification: enabled by default. Set WEKNORA_VERIFY_SSL=false to disable
         # (e.g. for self-signed certs in dev environments — NOT recommended for production).
         self.verify_ssl = os.getenv("WEKNORA_VERIFY_SSL", "true").lower() != "false"
@@ -142,6 +168,161 @@ class WeKnoraClient:
         # MCP 2.x runs sync @mcp.tool() handlers on worker threads; use a
         # thread-local Session because requests.Session is not thread-safe.
         self._session_local = threading.local()
+        self._knowledge_operation_local = threading.local()
+
+    def authorize_knowledge_bases(
+        self,
+        knowledge_base_ids: list[str],
+        employee_name: str = "",
+        knowledge_context_handle: str = "",
+        require_all: bool = True,
+        action: str = "runtime_read",
+    ) -> list[str] | None:
+        """Ask Portal to revalidate the user/session and current KB grants.
+
+        Returns None only when the Portal integration is explicitly not
+        configured. Once required or once a context is supplied, every
+        transport or authorization error is a denial.
+        """
+        self._knowledge_operation_local.operation = None
+        if not self.portal_knowledge_auth_url:
+            if PORTAL_KNOWLEDGE_AUTH_REQUIRED or employee_name or knowledge_context_handle:
+                raise PermissionError("online knowledge authorization is unavailable")
+            return None
+        if (
+            not _EMPLOYEE_NAME_RE.fullmatch(employee_name)
+            or len(employee_name) > 63
+            or not _OPAQUE_CONTEXT_RE.fullmatch(knowledge_context_handle)
+            or not knowledge_base_ids
+            or len(knowledge_base_ids) > 100
+            or any(not isinstance(kb_id, str) or not kb_id or len(kb_id) > 128 for kb_id in knowledge_base_ids)
+        ):
+            raise PermissionError("knowledge session context and explicit scope are required")
+        endpoint = f"{self.portal_knowledge_auth_url}/{urllib.parse.quote(employee_name, safe='')}/authorize"
+        try:
+            response = requests.post(
+                endpoint,
+                json={"knowledge_base_ids": knowledge_base_ids, "require_all": require_all, "action": action},
+                headers={"X-DeerFlow-Knowledge-Context": knowledge_context_handle},
+                timeout=5,
+                allow_redirects=False,
+            )
+            if response.status_code != 200:
+                raise PermissionError("knowledge access denied")
+            payload = response.json()
+            allowed = payload.get("knowledge_base_ids") if isinstance(payload, dict) else None
+            if not isinstance(allowed, list) or not allowed or any(not isinstance(value, str) for value in allowed):
+                raise PermissionError("knowledge access denied")
+            allowed_set = set(allowed)
+            if not allowed_set.issubset(set(knowledge_base_ids)):
+                raise PermissionError("invalid Portal authorization response")
+            if require_all and any(kb_id not in allowed_set for kb_id in knowledge_base_ids):
+                raise PermissionError("knowledge access denied")
+            operation_id = payload.get("operation_id")
+            if not isinstance(operation_id, str) or not operation_id:
+                raise PermissionError("invalid Portal audit operation")
+            self._knowledge_operation_local.operation = {
+                "operation_id": operation_id,
+                "employee_name": employee_name,
+                "context_handle": knowledge_context_handle,
+            }
+            return [kb_id for kb_id in knowledge_base_ids if kb_id in allowed_set]
+        except (RequestException, ValueError) as exc:
+            logger.warning("Portal knowledge authorization unavailable: %s", type(exc).__name__)
+            raise PermissionError("online knowledge authorization is unavailable") from exc
+
+    def authorize_knowledge_base(
+        self, kb_id: str, employee_name: str = "", knowledge_context_handle: str = "", action: str = "runtime_read"
+    ) -> str:
+        # Do not resolve names by listing the tenant-wide KB catalog before
+        # authorization. Runtime reads must use the explicit KB id supplied
+        # by the employee binding; a name lookup would be an unscoped read.
+        if not isinstance(kb_id, str) or not kb_id or len(kb_id) > 128 or "/" in kb_id or "\\" in kb_id:
+            raise PermissionError("explicit knowledge base id is required")
+        allowed = self.authorize_knowledge_bases(
+            [kb_id], employee_name, knowledge_context_handle, require_all=True, action=action
+        )
+        return kb_id if allowed is None else allowed[0]
+
+    def authorize_document(
+        self, knowledge_id: str, employee_name: str = "", knowledge_context_handle: str = "", action: str = "runtime_read"
+    ) -> None:
+        self._knowledge_operation_local.operation = None
+        if not self.portal_knowledge_auth_url:
+            if PORTAL_KNOWLEDGE_AUTH_REQUIRED or employee_name or knowledge_context_handle:
+                raise PermissionError("online knowledge authorization is unavailable")
+            return
+        if (
+            not _EMPLOYEE_NAME_RE.fullmatch(employee_name)
+            or not _OPAQUE_CONTEXT_RE.fullmatch(knowledge_context_handle)
+            or not knowledge_id
+            or len(knowledge_id) > 128
+        ):
+            raise PermissionError("knowledge session context and document id are required")
+        endpoint = f"{self.portal_knowledge_auth_url}/{urllib.parse.quote(employee_name, safe='')}/authorize"
+        try:
+            response = requests.post(
+                endpoint,
+                json={"document_id": knowledge_id, "action": action},
+                headers={"X-DeerFlow-Knowledge-Context": knowledge_context_handle},
+                timeout=5,
+                allow_redirects=False,
+            )
+            if response.status_code != 200:
+                raise PermissionError("knowledge access denied")
+            payload = response.json()
+            if not isinstance(payload, dict) or not isinstance(payload.get("knowledge_base_id"), str) or not payload["knowledge_base_id"]:
+                raise PermissionError("invalid Portal authorization response")
+            operation_id = payload.get("operation_id")
+            if not isinstance(operation_id, str) or not operation_id:
+                raise PermissionError("invalid Portal audit operation")
+            self._knowledge_operation_local.operation = {
+                "operation_id": operation_id,
+                "employee_name": employee_name,
+                "context_handle": knowledge_context_handle,
+            }
+        except (RequestException, ValueError) as exc:
+            logger.warning("Portal document authorization unavailable: %s", type(exc).__name__)
+            raise PermissionError("online knowledge authorization is unavailable") from exc
+
+    def _complete_knowledge_operation(self, success: bool, *, required: bool) -> None:
+        operation = getattr(self._knowledge_operation_local, "operation", None)
+        self._knowledge_operation_local.operation = None
+        if operation is None:
+            if required and PORTAL_KNOWLEDGE_AUTH_REQUIRED:
+                raise PermissionError("knowledge audit operation is unavailable")
+            return
+        endpoint = f"{self.portal_knowledge_auth_url}/{urllib.parse.quote(operation['employee_name'], safe='')}/authorize"
+        try:
+            response = requests.post(
+                endpoint,
+                json={"operation_id": operation["operation_id"], "outcome": "succeeded" if success else "failed", "status_code": 200 if success else 502},
+                headers={"X-DeerFlow-Knowledge-Context": operation["context_handle"]},
+                timeout=5,
+                allow_redirects=False,
+            )
+            if response.status_code != 204:
+                raise PermissionError("knowledge audit completion was rejected")
+        except (RequestException, ValueError) as exc:
+            logger.warning("Portal knowledge audit completion unavailable: %s", type(exc).__name__)
+            if required:
+                raise PermissionError("knowledge audit completion is unavailable") from exc
+
+    @contextmanager
+    def authorized_read(self):
+        """Complete Portal audit only after the actual upstream read returns."""
+        try:
+            yield
+        except Exception:
+            try:
+                self._complete_knowledge_operation(False, required=PORTAL_KNOWLEDGE_AUTH_REQUIRED)
+            except Exception as audit_error:
+                logger.warning("Portal knowledge failure audit unavailable: %s", type(audit_error).__name__)
+                if PORTAL_KNOWLEDGE_AUTH_REQUIRED:
+                    raise PermissionError("knowledge audit failure completion is unavailable") from audit_error
+            raise
+        else:
+            self._complete_knowledge_operation(True, required=PORTAL_KNOWLEDGE_AUTH_REQUIRED)
 
     def _new_session(self) -> requests.Session:
         session = requests.Session()
@@ -720,9 +901,23 @@ def create_knowledge_base(
 
 
 @mcp.tool()
-def list_knowledge_bases() -> dict:
+def list_knowledge_bases(
+    knowledge_base_ids: list[str] | None = None,
+    knowledge_employee_name: str = "",
+    knowledge_context_handle: str = "",
+) -> dict:
     """List all knowledge bases in the current workspace."""
-    return client.list_knowledge_bases()
+    requested = knowledge_base_ids or []
+    allowed = client.authorize_knowledge_bases(
+        requested, knowledge_employee_name, knowledge_context_handle, require_all=False,
+        action="list_bases",
+    )
+    with client.authorized_read():
+        response = client.list_knowledge_bases()
+        if allowed is None:
+            return response
+        allowed_set = set(allowed)
+        return {"data": [kb for kb in _normalize_kb_entries(response) if kb.get("id") in allowed_set], "total": len(allowed_set)}
 
 
 @mcp.tool()
@@ -732,9 +927,15 @@ def list_shared_knowledge_bases() -> dict:
 
 
 @mcp.tool()
-def get_knowledge_base(kb_id: str) -> dict:
+def get_knowledge_base(
+    kb_id: str,
+    knowledge_employee_name: str = "",
+    knowledge_context_handle: str = "",
+) -> dict:
     """Get knowledge base details."""
-    return client.get_knowledge_base(kb_id)
+    allowed_id = client.authorize_knowledge_base(kb_id, knowledge_employee_name, knowledge_context_handle, "read_base")
+    with client.authorized_read():
+        return client.get_knowledge_base(allowed_id)
 
 
 @mcp.tool()
@@ -750,19 +951,24 @@ def hybrid_search(
     vector_threshold: float = 0.5,
     keyword_threshold: float = 0.3,
     match_count: int = 5,
+    knowledge_employee_name: str = "",
+    knowledge_context_handle: str = "",
 ) -> dict:
     """Perform hybrid (vector + keyword) search in a knowledge base.
 
-    kb_id may be a UUID or a knowledge-base name (resolved automatically).
-    Use list_knowledge_bases or list_shared_knowledge_bases to discover available knowledge bases.
+    Supply the explicit knowledge-base ID assigned to this employee. The ID
+    must be in the authorized ``list_knowledge_bases`` scope; names and shared
+    workspace catalogs are not accepted by the enterprise runtime path.
     """
     config = {
         "vector_threshold": vector_threshold,
         "keyword_threshold": keyword_threshold,
         "match_count": match_count,
     }
-    resolved = client.resolve_kb_id(kb_id)
-    return client.hybrid_search(resolved, query, config)
+    _validate_hybrid_search(query, vector_threshold, keyword_threshold, match_count)
+    resolved = client.authorize_knowledge_base(kb_id, knowledge_employee_name, knowledge_context_handle, "search")
+    with client.authorized_read():
+        return client.hybrid_search(resolved, query, config)
 
 
 @mcp.tool()
@@ -841,21 +1047,32 @@ def list_knowledge(
     page_size: int = 20,
     folder_path: str | None = None,
     folder_scope: str = "",
+    knowledge_employee_name: str = "",
+    knowledge_context_handle: str = "",
 ) -> dict:
     """List knowledge entries in a knowledge base.
 
     ``folder_path`` optionally filters to one folder (``""`` = root).
     ``folder_scope`` is forwarded when the backend supports scoped listing.
     """
-    return client.list_knowledge(
-        kb_id, page, page_size, folder_path=folder_path, folder_scope=folder_scope
-    )
+    _validate_read_pagination(page, page_size)
+    allowed_id = client.authorize_knowledge_base(kb_id, knowledge_employee_name, knowledge_context_handle, "list_documents")
+    with client.authorized_read():
+        return client.list_knowledge(
+            allowed_id, page, page_size, folder_path=folder_path, folder_scope=folder_scope
+        )
 
 
 @mcp.tool()
-def get_knowledge(knowledge_id: str) -> dict:
+def get_knowledge(
+    knowledge_id: str,
+    knowledge_employee_name: str = "",
+    knowledge_context_handle: str = "",
+) -> dict:
     """Get knowledge details."""
-    return client.get_knowledge(knowledge_id)
+    client.authorize_document(knowledge_id, knowledge_employee_name, knowledge_context_handle, "read_document")
+    with client.authorized_read():
+        return client.get_knowledge(knowledge_id)
 
 
 @mcp.tool()
@@ -1058,9 +1275,18 @@ def get_agent(agent_id: str) -> dict:
 
 
 @mcp.tool()
-def list_chunks(knowledge_id: str, page: int = 1, page_size: int = 20) -> dict:
+def list_chunks(
+    knowledge_id: str,
+    page: int = 1,
+    page_size: int = 20,
+    knowledge_employee_name: str = "",
+    knowledge_context_handle: str = "",
+) -> dict:
     """List chunks (text segments) of a knowledge entry."""
-    return client.list_chunks(knowledge_id, page, page_size)
+    _validate_read_pagination(page, page_size)
+    client.authorize_document(knowledge_id, knowledge_employee_name, knowledge_context_handle, "read_chunks")
+    with client.authorized_read():
+        return client.list_chunks(knowledge_id, page, page_size)
 
 
 @mcp.tool()
@@ -1070,32 +1296,54 @@ def delete_chunk(knowledge_id: str, chunk_id: str) -> dict:
 
 
 @mcp.tool()
-def wiki_search(kb_id: str, query: str, limit: int = 10) -> dict:
+def wiki_search(
+    kb_id: str,
+    query: str,
+    limit: int = 10,
+    knowledge_employee_name: str = "",
+    knowledge_context_handle: str = "",
+) -> dict:
     """Search wiki pages by full-text query.
 
     Returns matching wiki pages with title, slug, summary, and content snippets.
     """
-    return client.wiki_search(kb_id, query, limit)
+    allowed_id = client.authorize_knowledge_base(kb_id, knowledge_employee_name, knowledge_context_handle, "wiki_search")
+    with client.authorized_read():
+        return client.wiki_search(allowed_id, query, limit)
 
 
 @mcp.tool()
-def wiki_read_page(kb_id: str, slug: str) -> dict:
+def wiki_read_page(
+    kb_id: str,
+    slug: str,
+    knowledge_employee_name: str = "",
+    knowledge_context_handle: str = "",
+) -> dict:
     """Read a wiki page by its slug.
 
     Returns full markdown content, metadata, inbound/outbound links, and source
     references. slug example: 'entity/acme-corp', 'concept/rag'.
     """
-    return client.wiki_read_page(kb_id, slug)
+    allowed_id = client.authorize_knowledge_base(kb_id, knowledge_employee_name, knowledge_context_handle, "wiki_read_page")
+    with client.authorized_read():
+        return client.wiki_read_page(allowed_id, slug)
 
 
 @mcp.tool()
-def wiki_index_view(kb_id: str, limit: int = 50) -> dict:
+def wiki_index_view(
+    kb_id: str,
+    limit: int = 50,
+    knowledge_employee_name: str = "",
+    knowledge_context_handle: str = "",
+) -> dict:
     """Get a structured wiki index with per-type directory groups.
 
     Returns an overview of all wiki pages organized by type (entity, concept,
     summary, etc.).
     """
-    return client.wiki_index_view(kb_id, limit)
+    allowed_id = client.authorize_knowledge_base(kb_id, knowledge_employee_name, knowledge_context_handle, "wiki_index")
+    with client.authorized_read():
+        return client.wiki_index_view(allowed_id, limit)
 
 
 # ---------------------------------------------------------------------------
