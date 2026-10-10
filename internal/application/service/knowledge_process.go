@@ -284,22 +284,30 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	if len(opts) > 0 {
 		options = opts[0]
 	}
+	trustedImageRefs := trustedStoredImageRefs(options.StoredImages)
 
 	// Parser output and manually supplied passages can contain malformed byte
 	// sequences. Clean them before logging, chunk persistence, or embedding;
 	// the embedding provider and tracing/database drivers expect valid UTF-8.
 	for i := range chunks {
 		chunks[i].Content = common.CleanInvalidUTF8(chunks[i].Content)
+		chunks[i].Content = removeUntrustedResourceReferences(chunks[i].Content, trustedImageRefs)
 		chunks[i].ContextHeader = common.CleanInvalidUTF8(chunks[i].ContextHeader)
 		for j := range chunks[i].Images {
 			chunks[i].Images[j].URL = common.CleanInvalidUTF8(chunks[i].Images[j].URL)
 			chunks[i].Images[j].Caption = common.CleanInvalidUTF8(chunks[i].Images[j].Caption)
 			chunks[i].Images[j].OCRText = common.CleanInvalidUTF8(chunks[i].Images[j].OCRText)
 			chunks[i].Images[j].OriginalURL = common.CleanInvalidUTF8(chunks[i].Images[j].OriginalURL)
+			if _, isResource := types.ParseResourcePath(chunks[i].Images[j].URL); isResource {
+				if _, trusted := trustedImageRefs[chunks[i].Images[j].URL]; !trusted {
+					chunks[i].Images[j].URL = ""
+				}
+			}
 		}
 	}
 	for i := range options.ParentChunks {
 		options.ParentChunks[i].Content = common.CleanInvalidUTF8(options.ParentChunks[i].Content)
+		options.ParentChunks[i].Content = removeUntrustedResourceReferences(options.ParentChunks[i].Content, trustedImageRefs)
 	}
 
 	// Check if knowledge is being deleted/cancelled before processing.
@@ -340,6 +348,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 		}
 		return
 	}
+	preservedImageRefs := make(map[string]struct{})
 
 	// 删除旧的chunks
 	if err := s.chunkRepo.DeleteChunksByKnowledgeID(ctx, knowledge.TenantID, knowledge.ID); err != nil {
@@ -358,7 +367,8 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 		// last old binding here would remove its bytes before the new chunk can
 		// claim them. The deferred cleanup also runs on later failure paths, so
 		// stale old bindings are not retained when replacement processing fails.
-		defer releaseChunkImageResources(ctx, s.resourceCatalog, s.resolveFileService(ctx, kb), oldImages, []string{knowledge.ID})
+		defer releaseChunkImageResourcesExcept(ctx, s.resourceCatalog, s.resolveFileService(ctx, kb), oldImages,
+			[]string{knowledge.ID}, preservedImageRefs)
 	}
 
 	// 删除旧的索引数据 — only when vector/keyword indexing is enabled
@@ -468,7 +478,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 				ChunkType:       types.ChunkTypeParentText,
 			}
 			parentDBChunks[i].ImageInfo, _ = prepareChunkImageInfo(ctx, s.resourceCatalog,
-				knowledge.TenantID, parentDBChunks[i].Content)
+				knowledge.TenantID, parentDBChunks[i].Content, trustedImageRefs)
 		}
 		// Set prev/next links for parent chunks
 		for i := range parentDBChunks {
@@ -510,7 +520,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 			EndAt:           int(chunkData.End),
 			ChunkType:       types.ChunkTypeText,
 		}
-		imageInfo, refs := prepareChunkImageInfo(ctx, s.resourceCatalog, knowledge.TenantID, textChunk.Content)
+		imageInfo, refs := prepareChunkImageInfo(ctx, s.resourceCatalog, knowledge.TenantID, textChunk.Content, trustedImageRefs)
 		textChunk.ImageInfo = imageInfo
 		if len(refs) > 0 {
 			imageBindings = append(imageBindings, pendingChunkImageBinding{chunkID: textChunk.ID, refs: refs})
@@ -578,28 +588,53 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 		return
 	}
 	for _, parent := range parentDBChunks {
-		_, refs := prepareChunkImageInfo(ctx, s.resourceCatalog, knowledge.TenantID, parent.Content)
+		_, refs := prepareChunkImageInfo(ctx, s.resourceCatalog, knowledge.TenantID, parent.Content, trustedImageRefs)
 		if len(refs) > 0 {
 			imageBindings = append(imageBindings, pendingChunkImageBinding{chunkID: parent.ID, refs: refs})
 		}
 	}
 	type boundChunkImage struct{ chunkID, ref string }
 	var boundImages []boundChunkImage
+	boundKnowledgeImages := preservedImageRefs
+	rollbackImageBindings := func() error {
+		if err := s.chunkRepo.DeleteChunksByKnowledgeID(ctx, knowledge.TenantID, knowledge.ID); err != nil {
+			// Keep claims when persisted chunks remain: cleanup can retry from rows.
+			logger.Errorf(ctx, "Failed to delete chunks after image binding error; retaining bindings for retry: %v", err)
+			return err
+		}
+		var cleanupErr error
+		for _, bound := range boundImages {
+			if _, err := s.resourceCatalog.Release(ctx, bound.ref, types.ResourceOwnerKnowledgeChunk, bound.chunkID); err != nil {
+				cleanupErr = errors.Join(cleanupErr, err)
+			}
+		}
+		for ref := range boundKnowledgeImages {
+			if _, err := s.resourceCatalog.Release(ctx, ref, types.ResourceOwnerKnowledgeImage, knowledge.ID); err != nil {
+				cleanupErr = errors.Join(cleanupErr, err)
+			}
+		}
+		return cleanupErr
+	}
 	for _, binding := range imageBindings {
 		for _, ref := range binding.refs {
-			if err := bindChunkImageResource(ctx, s.resourceCatalog, knowledge.TenantID, binding.chunkID, ref); err != nil {
-				cleanupErr := s.chunkRepo.DeleteChunksByKnowledgeID(ctx, knowledge.TenantID, knowledge.ID)
-				if cleanupErr == nil {
-					for _, bound := range boundImages {
-						if _, releaseErr := s.resourceCatalog.Release(ctx, bound.ref, types.ResourceOwnerKnowledgeChunk, bound.chunkID); releaseErr != nil {
-							cleanupErr = errors.Join(cleanupErr, releaseErr)
-						}
+			if _, ok := boundKnowledgeImages[ref]; !ok {
+				if err := bindExtractedImageToKnowledge(ctx, s.resourceCatalog, knowledge.TenantID,
+					knowledge.ID, ref, trustedImageRefs); err != nil {
+					if cleanupErr := rollbackImageBindings(); cleanupErr != nil {
+						err = errors.Join(err, cleanupErr)
 					}
-				} else {
-					// Keep bindings when chunk deletion fails: a later reparse can
-					// still enumerate the persisted rows and retry cleanup safely.
-					logger.Errorf(ctx, "Failed to delete chunks after image binding error; retaining bindings for retry: %v", cleanupErr)
+					knowledge.ParseStatus = types.ParseStatusFailed
+					knowledge.ErrorMessage = "failed to record trusted extracted image provenance"
+					knowledge.UpdatedAt = time.Now()
+					_ = s.repo.UpdateKnowledge(ctx, knowledge)
+					s.failStage(ctx, knowledge.ID, types.StageChunking,
+						werrors.ErrCodeChunkingFailed, "bind extracted image provenance failed", err)
+					return
 				}
+				boundKnowledgeImages[ref] = struct{}{}
+			}
+			if err := bindChunkImageResource(ctx, s.resourceCatalog, knowledge.TenantID, binding.chunkID, ref, trustedImageRefs); err != nil {
+				cleanupErr := rollbackImageBindings()
 				if cleanupErr != nil {
 					err = errors.Join(err, cleanupErr)
 				}
@@ -3132,6 +3167,25 @@ func (s *knowledgeService) UpdateImageInfo(
 		return nil
 	}
 	image := images[0]
+	trustedImageRefs := make(map[string]struct{})
+	for _, ref := range []string{image.URL, image.OriginalURL} {
+		if _, isResource := types.ParseResourcePath(ref); !isResource {
+			continue
+		}
+		lookup, ok := s.resourceCatalog.(interfaces.ExtractedKnowledgeImageLookup)
+		if !ok {
+			return werrors.NewForbiddenError("trusted extracted image provenance is unavailable")
+		}
+		allowed, err := lookup.IsExtractedImageForKnowledge(ctx, knowledge.TenantID,
+			knowledge.KnowledgeBaseID, knowledge.ID, ref)
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			return werrors.NewForbiddenError("image is not a trusted extracted resource of this knowledge")
+		}
+		trustedImageRefs[ref] = struct{}{}
+	}
 
 	// Retrieve all chunks with the given parent chunk ID
 	chunk, err := s.chunkService.GetChunkByID(ctx, chunkID)
@@ -3272,7 +3326,10 @@ func (s *knowledgeService) UpdateImageInfo(
 	// cannot discover from the stored image_info column.
 	if s.resourceCatalog != nil {
 		for _, imageChunk := range append(updateChunk, addChunk...) {
-			if err := bindChunkImageResourceIfStored(ctx, s.resourceCatalog, tenantID, imageChunk.ID, image.URL); err != nil {
+			if _, isResource := types.ParseResourcePath(image.URL); !isResource {
+				continue
+			}
+			if err := bindChunkImageResource(ctx, s.resourceCatalog, tenantID, imageChunk.ID, image.URL, trustedImageRefs); err != nil {
 				return fmt.Errorf("bind image to persisted chunk: %w", err)
 			}
 		}

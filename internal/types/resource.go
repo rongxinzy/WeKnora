@@ -26,6 +26,7 @@ const (
 // files, and lets either copy be deleted without breaking the other.
 const (
 	ResourceOwnerKnowledge         = "knowledge"
+	ResourceOwnerKnowledgeImage    = "knowledge_image"
 	ResourceOwnerKnowledgeChunk    = "knowledge_chunk"
 	ResourceOwnerMessage           = "message"
 	ResourceOwnerTemporaryDocument = "temporary_document"

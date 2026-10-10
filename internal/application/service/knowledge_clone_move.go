@@ -400,7 +400,7 @@ func (s *knowledgeService) CloneChunk(ctx context.Context, src, dst *types.Knowl
 			return err
 		}
 		for _, chunk := range chunks {
-			if err := bindChunkImageInfo(ctx, s.resourceCatalog, dst.TenantID, chunk.ID, chunk.ImageInfo); err != nil {
+			if err := bindTransferredChunkImageInfo(ctx, s.resourceCatalog, dst.TenantID, dst.ID, chunk.ID, chunk.ImageInfo); err != nil {
 				return fmt.Errorf("bind cloned chunk images: %w", err)
 			}
 		}
@@ -867,7 +867,7 @@ func (s *knowledgeService) cloneFAQKnowledgeBase(
 			return err
 		}
 		for _, chunk := range newChunks {
-			if err := bindChunkImageInfo(ctx, s.resourceCatalog, dstKB.TenantID, chunk.ID, chunk.ImageInfo); err != nil {
+			if err := bindTransferredChunkImageInfo(ctx, s.resourceCatalog, dstKB.TenantID, dstKnowledge.ID, chunk.ID, chunk.ImageInfo); err != nil {
 				logger.Errorf(ctx, "Failed to bind cloned FAQ images: %v", err)
 				handleError(progress, err, "Failed to bind FAQ images")
 				newChunkIDs := make([]string, 0, len(newChunks))

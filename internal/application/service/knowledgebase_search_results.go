@@ -3,11 +3,14 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"html"
+	"net/url"
 	"slices"
 
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/searchutil"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
 
 // processSearchResults handles the processing of search results, optimizing database queries.
@@ -85,9 +88,105 @@ func (s *knowledgeBaseService) processSearchResults(ctx context.Context,
 	searchResults := s.assembleSearchResults(ctx, chunks, chunkMap, knowledgeMap, index, skipEnrichment)
 
 	searchutil.EnrichSearchResultsImageInfo(ctx, s.chunkRepo, tenantID, searchResults)
+	if err := s.sanitizeSearchResultResourceReferences(ctx, tenantID, searchResults); err != nil {
+		return nil, err
+	}
 
 	logger.Infof(ctx, "Search results processed, total: %d", len(searchResults))
 	return searchResults, nil
+}
+
+// sanitizeSearchResultResourceReferences prevents legacy or caller-injected
+// handles in persisted chunk text/image metadata from becoming signed URLs in
+// search responses. Only the exact knowledge's parser-owned extracted_image
+// relation is accepted; chunk/attachment bindings alone are not provenance.
+func (s *knowledgeBaseService) sanitizeSearchResultResourceReferences(
+	ctx context.Context, tenantID uint64, results []*types.SearchResult,
+) error {
+	lookup, _ := s.resourceCatalog.(interfaces.ExtractedKnowledgeImageLookup)
+	type markerKey struct{ kbID, knowledgeID, ref string }
+	markerCache := make(map[markerKey]bool)
+	for _, result := range results {
+		if result == nil {
+			continue
+		}
+		trusted := make(map[string]struct{})
+		for _, text := range []string{result.Content, result.MatchedContent, result.ImageInfo} {
+			decoded := text
+			for i := 0; i < 3; i++ {
+				next := html.UnescapeString(decoded)
+				if unescaped, err := url.PathUnescape(next); err == nil {
+					next = unescaped
+				}
+				if next == decoded {
+					break
+				}
+				decoded = next
+			}
+			for _, ref := range resourceReferenceForSanitizing.FindAllString(decoded, -1) {
+				canonical, valid := canonicalResourceReference(ref)
+				if !valid {
+					continue
+				}
+				key := markerKey{result.KnowledgeBaseID, result.KnowledgeID, canonical}
+				if allowed, cached := markerCache[key]; cached {
+					if allowed {
+						trusted[canonical] = struct{}{}
+					}
+					continue
+				}
+				if lookup == nil {
+					markerCache[key] = false
+					continue
+				}
+				allowed, err := lookup.IsExtractedImageForKnowledge(ctx, tenantID,
+					result.KnowledgeBaseID, result.KnowledgeID, canonical)
+				if err != nil {
+					return err
+				}
+				markerCache[key] = allowed
+				if allowed {
+					trusted[canonical] = struct{}{}
+				}
+			}
+		}
+		result.Content = removeUntrustedResourceReferences(result.Content, trusted)
+		result.MatchedContent = removeUntrustedResourceReferences(result.MatchedContent, trusted)
+		if result.ImageInfo != "" {
+			var images []types.ImageInfo
+			if err := json.Unmarshal([]byte(result.ImageInfo), &images); err != nil {
+				result.ImageInfo = ""
+			} else {
+				filtered := images[:0]
+				for _, image := range images {
+					if canonical, originalIsResource := canonicalResourceReference(image.OriginalURL); originalIsResource {
+						if _, ok := trusted[canonical]; !ok {
+							image.OriginalURL = ""
+						} else {
+							image.OriginalURL = canonical
+						}
+					}
+					resourceURL, isResource := canonicalResourceReference(image.URL)
+					if !isResource {
+						filtered = append(filtered, image)
+						continue
+					}
+					if _, ok := trusted[resourceURL]; ok && resourceURL != "" {
+						image.URL = resourceURL
+						filtered = append(filtered, image)
+					}
+				}
+				if len(filtered) == 0 {
+					result.ImageInfo = ""
+				} else if encoded, err := json.Marshal(filtered); err == nil {
+					result.ImageInfo = string(encoded)
+				} else {
+					result.ImageInfo = ""
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // chunkIndex holds pre-computed lookup structures for processing search results.

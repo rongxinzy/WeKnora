@@ -4,13 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
+	"net/url"
+	"regexp"
 	"sort"
+	"strings"
 
+	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/searchutil"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
-	"github.com/google/uuid"
 )
 
 type pendingChunkImageBinding struct {
@@ -21,6 +25,31 @@ type pendingChunkImageBinding struct {
 type contentResourceTransitionClaim struct {
 	ref     string
 	ownerID string
+}
+
+var resourceReferenceForSanitizing = regexp.MustCompile(`(?i)resource://[A-Za-z0-9_-]+`)
+
+func canonicalResourceReference(value string) (string, bool) {
+	decoded := value
+	for i := 0; i < 3; i++ {
+		next := html.UnescapeString(decoded)
+		if unescaped, err := url.PathUnescape(next); err == nil {
+			next = unescaped
+		}
+		if next == decoded {
+			break
+		}
+		decoded = next
+	}
+	match := resourceReferenceForSanitizing.FindString(decoded)
+	if match == "" {
+		return "", false
+	}
+	canonical := types.ResourceScheme + match[len(types.ResourceScheme):]
+	if _, ok := types.ParseResourcePath(canonical); !ok {
+		return "", false
+	}
+	return canonical, true
 }
 
 func holdReplacementResourcesBeforeCleanup(
@@ -46,28 +75,15 @@ func holdReplacementResourcesBeforeCleanup(
 func holdContentResourceClaims(
 	ctx context.Context, catalog interfaces.ResourceCatalog, fileSvc interfaces.FileService, tenantID uint64, content string,
 ) ([]contentResourceTransitionClaim, error) {
-	if catalog == nil || tenantID == 0 {
-		return nil, nil
-	}
-	refs := types.ScanResourceReferences(content)
-	claims := make([]contentResourceTransitionClaim, 0, len(refs))
-	for _, ref := range refs {
-		resource, err := catalog.Resolve(ctx, ref)
-		if err != nil {
-			releaseContentResourceClaims(ctx, catalog, fileSvc, claims)
-			return nil, fmt.Errorf("resolve replacement content resource: %w", err)
-		}
-		if resource == nil || resource.TenantID != tenantID || resource.State != types.ResourceStateActive {
-			continue
-		}
-		ownerID := uuid.NewString()
-		if err := catalog.Bind(ctx, ref, types.ResourceOwnerTemporaryDocument, ownerID, types.ResourceRelationAttachment); err != nil {
-			releaseContentResourceClaims(ctx, catalog, fileSvc, claims)
-			return nil, fmt.Errorf("hold replacement content resource: %w", err)
-		}
-		claims = append(claims, contentResourceTransitionClaim{ref: ref, ownerID: ownerID})
-	}
-	return claims, nil
+	// Rich-text bodies are caller controlled. A handle mentioned in the body is
+	// not evidence that this document owns it, so never create a temporary claim
+	// from raw content. Images produced by the parser are claimed later from the
+	// resolver's explicit StoredImages allowlist.
+	_ = catalog
+	_ = fileSvc
+	_ = tenantID
+	_ = content
+	return nil, nil
 }
 
 func releaseContentResourceClaims(
@@ -94,7 +110,9 @@ func releaseContentResourceClaims(
 // prepareChunkImageInfo projects only stored image resources referenced by the
 // chunk's rendered Markdown/HTML. External URLs and arbitrary provider paths
 // remain ordinary content and are never made downloadable through this API.
-func prepareChunkImageInfo(ctx context.Context, catalog interfaces.ResourceCatalog, tenantID uint64, content string) (string, []string) {
+func prepareChunkImageInfo(
+	ctx context.Context, catalog interfaces.ResourceCatalog, tenantID uint64, content string, trustedRefs map[string]struct{},
+) (string, []string) {
 	if catalog == nil || tenantID == 0 {
 		return "", nil
 	}
@@ -102,6 +120,9 @@ func prepareChunkImageInfo(ctx context.Context, catalog interfaces.ResourceCatal
 	refs := make([]string, 0, len(urls))
 	for ref := range urls {
 		if _, ok := types.ParseResourcePath(ref); !ok {
+			continue
+		}
+		if _, ok := trustedRefs[ref]; !ok {
 			continue
 		}
 		resource, err := catalog.Resolve(ctx, ref)
@@ -127,12 +148,63 @@ func prepareChunkImageInfo(ctx context.Context, catalog interfaces.ResourceCatal
 	return string(data), refs
 }
 
-func bindChunkImageResource(ctx context.Context, catalog interfaces.ResourceCatalog, tenantID uint64, chunkID, ref string) error {
+// trustedStoredImageRefs derives provenance only from handles returned by the
+// server-side image resolver during this processing attempt. Content itself is
+// never an authority source for a resource handle.
+func trustedStoredImageRefs(images []docparser.StoredImage) map[string]struct{} {
+	refs := make(map[string]struct{}, len(images))
+	for _, image := range images {
+		if _, ok := types.ParseResourcePath(image.ServingURL); ok {
+			refs[image.ServingURL] = struct{}{}
+		}
+	}
+	return refs
+}
+
+// removeUntrustedResourceReferences keeps resolver-created handles but removes
+// every other literal resource handle before chunking/indexing. This prevents
+// search output from later turning caller-supplied handles into signed image
+// URLs even when no ImageInfo entry was created.
+func removeUntrustedResourceReferences(content string, trustedRefs map[string]struct{}) string {
+	decoded := content
+	for i := 0; i < 3; i++ {
+		next := html.UnescapeString(decoded)
+		if unescaped, err := url.PathUnescape(next); err == nil {
+			next = unescaped
+		}
+		if next == decoded {
+			break
+		}
+		decoded = next
+	}
+	if decoded != content && resourceReferenceForSanitizing.MatchString(decoded) {
+		// If an entity/percent alias decodes to a storage handle, normalize this
+		// adversarial passage before removing the handle so it cannot be signed
+		// later by the generic response URL rewriter.
+		content = decoded
+	}
+	for _, ref := range resourceReferenceForSanitizing.FindAllString(content, -1) {
+		canonical, isResource := canonicalResourceReference(ref)
+		if isResource {
+			if _, ok := trustedRefs[canonical]; !ok {
+				content = strings.ReplaceAll(content, ref, "")
+			}
+		}
+	}
+	return content
+}
+
+func bindChunkImageResource(
+	ctx context.Context, catalog interfaces.ResourceCatalog, tenantID uint64, chunkID, ref string, trustedRefs map[string]struct{},
+) error {
 	if catalog == nil || tenantID == 0 || chunkID == "" {
 		return fmt.Errorf("chunk image binding requires catalog, tenant, and chunk")
 	}
 	if _, ok := types.ParseResourcePath(ref); !ok {
 		return fmt.Errorf("chunk image must be a registered resource handle")
+	}
+	if _, ok := trustedRefs[ref]; !ok {
+		return fmt.Errorf("chunk image resource was not produced by the trusted parser")
 	}
 	resource, err := catalog.Resolve(ctx, ref)
 	if err != nil {
@@ -144,19 +216,39 @@ func bindChunkImageResource(ctx context.Context, catalog interfaces.ResourceCata
 	return catalog.Bind(ctx, ref, types.ResourceOwnerKnowledgeChunk, chunkID, types.ResourceRelationChunkImage)
 }
 
-// bindChunkImageResourceIfStored preserves legacy image metadata writes while
-// granting download capability only to active resource handles.
-func bindChunkImageResourceIfStored(ctx context.Context, catalog interfaces.ResourceCatalog, tenantID uint64, chunkID, ref string) error {
-	if catalog == nil {
+func bindExtractedImageToKnowledge(
+	ctx context.Context, catalog interfaces.ResourceCatalog, tenantID uint64, knowledgeID, ref string, trustedRefs map[string]struct{},
+) error {
+	if catalog == nil || tenantID == 0 || knowledgeID == "" {
+		return fmt.Errorf("extracted image provenance requires catalog, tenant, and knowledge")
+	}
+	if _, ok := trustedRefs[ref]; !ok {
+		return fmt.Errorf("extracted image was not produced by the trusted parser")
+	}
+	resource, err := catalog.Resolve(ctx, ref)
+	if err != nil {
+		return err
+	}
+	if resource == nil || resource.TenantID != tenantID || resource.Kind != "image" || resource.State != types.ResourceStateActive {
+		return fmt.Errorf("extracted image is not active in the owning tenant")
+	}
+	lookup, ok := catalog.(interfaces.ResourceBindingLookup)
+	if !ok {
+		return fmt.Errorf("resource catalog cannot verify extracted image provenance")
+	}
+	hasMarker, err := lookup.HasBinding(ctx, ref, types.ResourceOwnerKnowledgeImage, knowledgeID, types.ResourceRelationExtractedImage)
+	if err != nil {
+		return err
+	}
+	if hasMarker {
 		return nil
 	}
-	if _, ok := types.ParseResourcePath(ref); !ok {
-		return nil
-	}
-	return bindChunkImageResource(ctx, catalog, tenantID, chunkID, ref)
+	return catalog.Bind(ctx, ref, types.ResourceOwnerKnowledgeImage, knowledgeID, types.ResourceRelationExtractedImage)
 }
 
-func bindChunkImageInfo(ctx context.Context, catalog interfaces.ResourceCatalog, tenantID uint64, chunkID, imageInfo string) error {
+// bindTransferredChunkImageInfo is only for clone/transfer flows after their
+// caller has validated the KB transfer and copied the source image object.
+func bindTransferredChunkImageInfo(ctx context.Context, catalog interfaces.ResourceCatalog, tenantID uint64, knowledgeID, chunkID, imageInfo string) error {
 	if catalog == nil || imageInfo == "" {
 		return nil
 	}
@@ -164,20 +256,53 @@ func bindChunkImageInfo(ctx context.Context, catalog interfaces.ResourceCatalog,
 	if err := json.Unmarshal([]byte(imageInfo), &images); err != nil {
 		return fmt.Errorf("decode chunk image info: %w", err)
 	}
-	var bound []string
+	var boundChunks []string
+	var newMarkers []string
+	rollback := func() {
+		for _, ref := range boundChunks {
+			_, _ = catalog.Release(ctx, ref, types.ResourceOwnerKnowledgeChunk, chunkID)
+		}
+		for _, ref := range newMarkers {
+			_, _ = catalog.Release(ctx, ref, types.ResourceOwnerKnowledgeImage, knowledgeID)
+		}
+	}
 	for _, image := range images {
 		if _, ok := types.ParseResourcePath(image.URL); !ok {
 			// Legacy provider paths and external URLs remain descriptive metadata.
 			// They are never promoted to an authorized image-download binding.
 			continue
 		}
-		if err := bindChunkImageResource(ctx, catalog, tenantID, chunkID, image.URL); err != nil {
-			for _, ref := range bound {
-				_, _ = catalog.Release(ctx, ref, types.ResourceOwnerKnowledgeChunk, chunkID)
+		resource, err := catalog.Resolve(ctx, image.URL)
+		if err != nil || resource == nil || resource.TenantID != tenantID || resource.Kind != "image" || resource.State != types.ResourceStateActive {
+			if err == nil {
+				err = fmt.Errorf("transferred image is not active in the destination tenant")
 			}
+			rollback()
 			return err
 		}
-		bound = append(bound, image.URL)
+		bindingLookup, ok := catalog.(interfaces.ResourceBindingLookup)
+		if !ok {
+			rollback()
+			return fmt.Errorf("resource catalog cannot verify transferred image provenance")
+		}
+		hadMarker, err := bindingLookup.HasBinding(ctx, image.URL, types.ResourceOwnerKnowledgeImage,
+			knowledgeID, types.ResourceRelationExtractedImage)
+		if err != nil {
+			rollback()
+			return err
+		}
+		if err := catalog.Bind(ctx, image.URL, types.ResourceOwnerKnowledgeChunk, chunkID, types.ResourceRelationChunkImage); err != nil {
+			rollback()
+			return err
+		}
+		boundChunks = append(boundChunks, image.URL)
+		if !hadMarker {
+			if err := catalog.Bind(ctx, image.URL, types.ResourceOwnerKnowledgeImage, knowledgeID, types.ResourceRelationExtractedImage); err != nil {
+				rollback()
+				return err
+			}
+			newMarkers = append(newMarkers, image.URL)
+		}
 	}
 	return nil
 }
@@ -188,6 +313,17 @@ func releaseChunkImageResources(
 	fileSvc interfaces.FileService,
 	rows []interfaces.ChunkImageInfo,
 	knowledgeIDs []string,
+) {
+	releaseChunkImageResourcesExcept(ctx, catalog, fileSvc, rows, knowledgeIDs, nil)
+}
+
+func releaseChunkImageResourcesExcept(
+	ctx context.Context,
+	catalog interfaces.ResourceCatalog,
+	fileSvc interfaces.FileService,
+	rows []interfaces.ChunkImageInfo,
+	knowledgeIDs []string,
+	preservedKnowledgeImages map[string]struct{},
 ) {
 	if len(rows) == 0 {
 		return
@@ -226,7 +362,10 @@ func releaseChunkImageResources(
 				remaining = count
 			}
 			for _, knowledgeID := range knowledgeIDs {
-				count, err := catalog.Release(ctx, ref, types.ResourceOwnerKnowledge, knowledgeID)
+				if _, preserve := preservedKnowledgeImages[ref]; preserve {
+					continue
+				}
+				count, err := catalog.Release(ctx, ref, types.ResourceOwnerKnowledgeImage, knowledgeID)
 				if err != nil {
 					logger.Warnf(ctx, "Failed to release legacy knowledge image binding: %v", err)
 					remaining = 1 // fail closed: retain bytes

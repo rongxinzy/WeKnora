@@ -38,9 +38,30 @@ func (r *resourceRepository) IsKnowledgeChunkImage(
 		Joins("JOIN knowledge_bases AS kb ON kb.id = k.knowledge_base_id AND kb.tenant_id = k.tenant_id AND kb.deleted_at IS NULL").
 		Where("b.resource_id = ? AND b.owner_type = ? AND b.relation = ? AND b.tenant_id = ? "+
 			"AND c.id = ? AND c.knowledge_id = ? AND c.knowledge_base_id = ? AND c.deleted_at IS NULL "+
-			"AND k.id = ? AND k.knowledge_base_id = ? AND k.deleted_at IS NULL AND k.parse_status <> ?",
+			"AND k.id = ? AND k.knowledge_base_id = ? AND k.deleted_at IS NULL AND k.parse_status NOT IN (?, ?, ?)",
 			resourceID, types.ResourceOwnerKnowledgeChunk, types.ResourceRelationChunkImage,
-			tenantID, chunkID, knowledgeID, kbID, knowledgeID, kbID, types.ParseStatusDeleting).Count(&count).Error
+			tenantID, chunkID, knowledgeID, kbID, knowledgeID, kbID,
+			types.ParseStatusFailed, types.ParseStatusDeleting, types.ParseStatusCancelled).Count(&count).Error
+	return count > 0, err
+}
+
+// IsExtractedImageForKnowledge accepts only the parser-owned marker relation.
+// Generic attachment bindings and chunk image bindings are not provenance.
+func (r *resourceRepository) IsExtractedImageForKnowledge(
+	ctx context.Context, tenantID uint64, kbID, knowledgeID, resourceID string,
+) (bool, error) {
+	if tenantID == 0 || kbID == "" || knowledgeID == "" || resourceID == "" {
+		return false, nil
+	}
+	var count int64
+	err := r.db.WithContext(ctx).Table("resource_bindings AS b").
+		Joins("JOIN knowledges AS k ON k.id = b.owner_id AND k.tenant_id = b.tenant_id").
+		Joins("JOIN knowledge_bases AS kb ON kb.id = k.knowledge_base_id AND kb.tenant_id = k.tenant_id AND kb.deleted_at IS NULL").
+		Where("b.resource_id = ? AND b.owner_type = ? AND b.relation = ? AND b.tenant_id = ? "+
+			"AND k.id = ? AND k.knowledge_base_id = ? AND k.deleted_at IS NULL AND k.parse_status NOT IN (?, ?, ?)",
+			resourceID, types.ResourceOwnerKnowledgeImage, types.ResourceRelationExtractedImage,
+			tenantID, knowledgeID, kbID,
+			types.ParseStatusFailed, types.ParseStatusDeleting, types.ParseStatusCancelled).Count(&count).Error
 	return count > 0, err
 }
 

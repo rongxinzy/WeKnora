@@ -124,3 +124,41 @@ func TestKnowledgeChunkImageRequiresExactDocumentChunkAndTenantBinding(t *testin
 	require.NoError(t, err)
 	require.False(t, ok, "a document in the asynchronous deletion window cannot authorize image reads")
 }
+
+func TestExtractedImageProvenanceIsSeparateFromAttachmentAndReleasedOnReparse(t *testing.T) {
+	catalog, db := newResourceCatalogForTest(t)
+	require.NoError(t, db.AutoMigrate(&types.KnowledgeBase{}, &types.Knowledge{}, &types.Chunk{}, &types.WikiPage{}))
+	ctx := context.Background()
+	ref, err := catalog.Register(ctx, 7, "local://7/exports/image.png", interfaces.ResourceRegistration{Kind: "image"})
+	require.NoError(t, err)
+	require.NoError(t, db.Create(&types.KnowledgeBase{ID: "kb", TenantID: 7}).Error)
+	require.NoError(t, db.Create(&types.Knowledge{ID: "doc", TenantID: 7, KnowledgeBaseID: "kb", Type: "manual", ParseStatus: types.ParseStatusCompleted}).Error)
+	resource, err := catalog.Resolve(ctx, ref)
+	require.NoError(t, err)
+	require.NoError(t, catalog.Bind(ctx, ref, types.ResourceOwnerKnowledge, "doc", types.ResourceRelationAttachment))
+	require.NoError(t, catalog.Bind(ctx, ref, types.ResourceOwnerKnowledge, "doc", types.ResourceRelationSourceFile))
+	require.NoError(t, catalog.Bind(ctx, ref, types.ResourceOwnerKnowledgeImage, "doc", types.ResourceRelationExtractedImage))
+	require.NoError(t, db.Create(&types.Chunk{ID: "chunk", TenantID: 7, KnowledgeID: "doc", KnowledgeBaseID: "kb", ImageInfo: `[{"url":"` + ref + `"}]`}).Error)
+
+	lookup := catalog.(interfaces.ExtractedKnowledgeImageLookup)
+	var markerCount int64
+	require.NoError(t, db.Model(&types.ResourceBinding{}).Where("resource_id = ? AND owner_type = ? AND owner_id = ? AND relation = ?", resource.ID,
+		types.ResourceOwnerKnowledgeImage, "doc", types.ResourceRelationExtractedImage).Count(&markerCount).Error)
+	require.EqualValues(t, 1, markerCount)
+	allowed, err := lookup.IsExtractedImageForKnowledge(ctx, 7, "kb", "doc", ref)
+	require.NoError(t, err)
+	require.True(t, allowed)
+	require.NoError(t, db.Model(&types.Knowledge{}).Where("id = ?", "doc").Update("parse_status", types.ParseStatusFailed).Error)
+	allowed, err = lookup.IsExtractedImageForKnowledge(ctx, 7, "kb", "doc", ref)
+	require.NoError(t, err)
+	require.False(t, allowed, "failed parse artifacts cannot authorize image reads")
+	require.NoError(t, db.Model(&types.Knowledge{}).Where("id = ?", "doc").Update("parse_status", types.ParseStatusCompleted).Error)
+
+	releaseChunkImageResources(ctx, catalog, nil, []interfaces.ChunkImageInfo{{ChunkID: "chunk", ImageInfo: `[{"url":"` + ref + `"}]`}}, []string{"doc"})
+	allowed, err = lookup.IsExtractedImageForKnowledge(ctx, 7, "kb", "doc", ref)
+	require.NoError(t, err)
+	require.False(t, allowed, "reparse cleanup removes the extracted-image provenance")
+	var remaining int64
+	require.NoError(t, db.Model(&types.ResourceBinding{}).Where("resource_id = ?", resource.ID).Count(&remaining).Error)
+	require.EqualValues(t, 2, remaining, "releasing parser provenance must preserve source-file and attachment rows")
+}
