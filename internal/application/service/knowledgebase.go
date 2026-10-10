@@ -941,23 +941,41 @@ func (s *knowledgeBaseService) ProcessKBDelete(ctx context.Context, t *asynq.Tas
 		// Collect image URLs before chunks are deleted
 		chunkImageInfos, imgErr := s.chunkRepo.ListImageInfoByKnowledgeIDs(ctx, tenantID, knowledgeIDs)
 		if imgErr != nil {
-			logger.Warnf(ctx, "Failed to collect image URLs for KB delete: %v", imgErr)
+			logger.Errorf(ctx, "Failed to collect image URLs for KB delete; preserving chunks for retry: %v", imgErr)
+			return fmt.Errorf("collect chunk image references for KB delete: %w", imgErr)
 		}
-		var imageInfoStrs []string
-		for _, ci := range chunkImageInfos {
-			imageInfoStrs = append(imageInfoStrs, ci.ImageInfo)
-		}
-		imageURLs := collectImageURLs(ctx, imageInfoStrs)
-
 		// Delete all chunks
 		logger.Infof(ctx, "Deleting all chunks in knowledge base")
+		deletedKnowledgeChunks := make(map[string]struct{}, len(knowledgeIDs))
+		var chunkDeleteErr error
 		for _, knowledgeID := range knowledgeIDs {
 			if err := s.chunkRepo.DeleteChunksByKnowledgeID(ctx, tenantID, knowledgeID); err != nil {
 				logger.Warnf(ctx, "Failed to delete chunks for knowledge %s: %v", knowledgeID, err)
+				chunkDeleteErr = errors.Join(chunkDeleteErr, fmt.Errorf("delete chunks for knowledge %s: %w", knowledgeID, err))
+			} else {
+				deletedKnowledgeChunks[knowledgeID] = struct{}{}
 			}
 		}
 
-		// Delete physical files, extracted images, and adjust storage
+		deletedImageRows := make([]interfaces.ChunkImageInfo, 0, len(chunkImageInfos))
+		for _, row := range chunkImageInfos {
+			if _, deleted := deletedKnowledgeChunks[row.KnowledgeID]; deleted {
+				deletedImageRows = append(deletedImageRows, row)
+			}
+		}
+		deletedKnowledgeIDs := make([]string, 0, len(deletedKnowledgeChunks))
+		for id := range deletedKnowledgeChunks {
+			deletedKnowledgeIDs = append(deletedKnowledgeIDs, id)
+		}
+		releaseChunkImageResources(ctx, s.resourceCatalog, s.fileSvc, deletedImageRows, deletedKnowledgeIDs)
+		if chunkDeleteErr != nil {
+			// Rows that were deleted above have had their image claims released;
+			// keep source files and knowledge rows until every chunk delete can
+			// succeed on retry. Failed IDs retain their chunk rows and bindings.
+			return chunkDeleteErr
+		}
+
+		// Delete physical files and adjust storage only after every chunk row is gone.
 		logger.Infof(ctx, "Deleting physical files and extracted images")
 		storageAdjust := int64(0)
 		for _, knowledge := range knowledgeList {
@@ -968,7 +986,6 @@ func (s *knowledgeBaseService) ProcessKBDelete(ctx context.Context, t *asynq.Tas
 			}
 			storageAdjust -= knowledge.StorageSize
 		}
-		deleteExtractedImages(ctx, s.fileSvc, knowledgeResourceOwners(s.resourceCatalog, knowledgeIDs...), imageURLs)
 		if storageAdjust != 0 {
 			if err := s.tenantRepo.AdjustStorageUsed(ctx, tenantID, storageAdjust); err != nil {
 				logger.Warnf(ctx, "Failed to adjust tenant storage: %v", err)

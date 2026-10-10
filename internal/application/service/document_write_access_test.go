@@ -65,8 +65,9 @@ func (r *documentKnowledgeSpy) DeleteKnowledgeList(ctx context.Context, tenant u
 
 type documentChunkSpy struct {
 	interfaces.ChunkRepository
-	writes   int
-	imageErr error
+	writes    int
+	imageErr  error
+	updateErr error
 }
 
 func (r *documentChunkSpy) CreateChunks(ctx context.Context, chunks []*types.Chunk) error {
@@ -81,6 +82,9 @@ func (r *documentChunkSpy) UpdateChunks(ctx context.Context, chunks []*types.Chu
 
 func (r *documentChunkSpy) UpdateChunk(ctx context.Context, chunk *types.Chunk) error {
 	r.writes++
+	if r.updateErr != nil {
+		return r.updateErr
+	}
 	return r.ChunkRepository.UpdateChunk(ctx, chunk)
 }
 

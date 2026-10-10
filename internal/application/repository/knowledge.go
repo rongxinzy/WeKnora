@@ -40,7 +40,7 @@ func escapeLikeKeyword(keyword string) string {
 // counter jump back up and never reach zero (the "stuck
 // pending_subtasks_count / never promoted to completed" bug). Omitting
 // the column here means Save can never touch it.
-var omitFieldsOnUpdate = []string{"DeletedAt", "PendingSubtasksCount"}
+var omitFieldsOnUpdate = []string{"DeletedAt", "PendingSubtasksCount", "ManualDisabled", "EnableStatus"}
 
 // knowledgeRepository implements knowledge base and knowledge repository interface
 type knowledgeRepository struct {
@@ -337,8 +337,11 @@ func (r *knowledgeRepository) UpdateKnowledge(ctx context.Context, knowledge *ty
 	if knowledge.CustomMetadata == nil {
 		omit = append(append([]string{}, omitFieldsOnUpdate...), "custom_metadata")
 	}
-	err := r.db.WithContext(ctx).Omit(omit...).Save(knowledge).Error
-	return err
+	db := r.db.WithContext(ctx)
+	if err := db.Omit(omit...).Save(knowledge).Error; err != nil {
+		return err
+	}
+	return r.writeEnableStatusRespectingManualDisable(db, knowledge.ID, knowledge.EnableStatus)
 }
 
 // UpdateKnowledgeBatch updates knowledge items in batch
@@ -351,7 +354,53 @@ func (r *knowledgeRepository) UpdateKnowledgeBatch(ctx context.Context, knowledg
 			knowledge.ErrorMessage = common.CleanInvalidUTF8(knowledge.ErrorMessage)
 		}
 	}
-	return r.db.Debug().WithContext(ctx).Omit(omitFieldsOnUpdate...).Save(knowledgeList).Error
+	db := r.db.Debug().WithContext(ctx)
+	if err := db.Omit(omitFieldsOnUpdate...).Save(knowledgeList).Error; err != nil {
+		return err
+	}
+	for _, knowledge := range knowledgeList {
+		if knowledge != nil {
+			if err := r.writeEnableStatusRespectingManualDisable(db, knowledge.ID, knowledge.EnableStatus); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// writeEnableStatusRespectingManualDisable evaluates the user's durable intent
+// inside the UPDATE statement. It is deliberately not based on a worker's
+// potentially stale Knowledge struct.
+func (r *knowledgeRepository) writeEnableStatusRespectingManualDisable(db *gorm.DB, id, status string) error {
+	if id == "" || status == "" {
+		return nil
+	}
+	return db.Model(&types.Knowledge{}).Where("id = ?", id).
+		UpdateColumn("enable_status", gorm.Expr(
+			"CASE WHEN manual_disabled THEN ? WHEN parse_status = ? AND enable_status = ? THEN ? ELSE ? END",
+			"disabled", types.ParseStatusCompleted, "enabled", "enabled", status)).Error
+}
+
+func (r *knowledgeRepository) SetKnowledgeEnabled(
+	ctx context.Context, tenantID uint64, id string, enabled bool,
+) (bool, error) {
+	if tenantID == 0 || id == "" {
+		return false, nil
+	}
+	updates := map[string]interface{}{"updated_at": time.Now()}
+	query := r.db.WithContext(ctx).Model(&types.Knowledge{}).
+		Where("tenant_id = ? AND id = ? AND deleted_at IS NULL AND parse_status <> ?",
+			tenantID, id, types.ParseStatusDeleting)
+	if enabled {
+		query = query.Where("parse_status = ?", types.ParseStatusCompleted)
+		updates["manual_disabled"] = false
+		updates["enable_status"] = "enabled"
+	} else {
+		updates["manual_disabled"] = true
+		updates["enable_status"] = "disabled"
+	}
+	result := query.Updates(updates)
+	return result.RowsAffected == 1, result.Error
 }
 
 // DeleteKnowledge deletes knowledge
@@ -563,6 +612,10 @@ func (r *knowledgeRepository) UpdateKnowledgeColumn(
 			value = common.CleanInvalidUTF8(string(v))
 		}
 	}
+	if column == "enable_status" {
+		value = gorm.Expr("CASE WHEN manual_disabled THEN ? WHEN parse_status = ? AND enable_status = ? THEN ? ELSE ? END",
+			"disabled", types.ParseStatusCompleted, "enabled", "enabled", value)
+	}
 	err := r.db.WithContext(ctx).Model(&types.Knowledge{}).Where("id = ?", id).Update(column, value).Error
 	return err
 }
@@ -586,6 +639,16 @@ func (r *knowledgeRepository) UpdateKnowledgeColumns(
 		case []byte:
 			values["error_message"] = common.CleanInvalidUTF8(string(v))
 		}
+	}
+	if value, ok := values["enable_status"]; ok {
+		targetParseStatus := types.ParseStatusCompleted
+		if parseStatus, exists := values["parse_status"]; exists {
+			targetParseStatus, _ = parseStatus.(string)
+		}
+		values["enable_status"] = gorm.Expr(
+			"CASE WHEN manual_disabled THEN ? WHEN parse_status = ? AND enable_status = ? AND ? = ? THEN ? ELSE ? END",
+			"disabled", types.ParseStatusCompleted, "enabled", targetParseStatus,
+			types.ParseStatusCompleted, "enabled", value)
 	}
 	return r.db.WithContext(ctx).Model(&types.Knowledge{}).Where("id = ?", id).Updates(values).Error
 }

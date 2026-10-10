@@ -24,6 +24,9 @@ func listKnowledgeBasesTool() mcp.Tool {
 		mcp.WithDescription("List the knowledge bases this endpoint can access, with their id, name, description "+
 			"and which retrieval modes (semantic, keyword, wiki) each supports. Call this first to learn what is in "+
 			"scope; other tools accept either the id or the exact name."),
+		mcp.WithString("knowledge_context_handle", mcp.Description("Portal-issued session capability; supplied only by the governed runtime")),
+		mcp.WithString("knowledge_employee_name", mcp.Description("Server-selected employee name; supplied only by the governed runtime")),
+		mcp.WithArray("knowledge_base_ids", mcp.WithStringItems(), mcp.Description("Knowledge-base ids selected by the governed runtime")),
 		mcp.WithReadOnlyHintAnnotation(true),
 	)
 }
@@ -41,6 +44,8 @@ func searchKnowledgeTool() mcp.Tool {
 		mcp.WithArray("knowledge_base_ids", mcp.WithStringItems(),
 			mcp.Description("Optional knowledge base ids or names to restrict the search; defaults to every "+
 				"knowledge base in scope")),
+		mcp.WithString("knowledge_context_handle", mcp.Description("Portal-issued session capability; supplied only by the governed runtime")),
+		mcp.WithString("knowledge_employee_name", mcp.Description("Server-selected employee name; supplied only by the governed runtime")),
 		mcp.WithReadOnlyHintAnnotation(true),
 	)
 }
@@ -56,6 +61,8 @@ func grepChunksTool() mcp.Tool {
 		mcp.WithNumber("limit", mcp.Description("Maximum passages to return, default 10, max 30")),
 		mcp.WithArray("knowledge_base_ids", mcp.WithStringItems(),
 			mcp.Description("Optional knowledge base ids or names to restrict the search")),
+		mcp.WithString("knowledge_context_handle", mcp.Description("Portal-issued session capability; supplied only by the governed runtime")),
+		mcp.WithString("knowledge_employee_name", mcp.Description("Server-selected employee name; supplied only by the governed runtime")),
 		mcp.WithReadOnlyHintAnnotation(true),
 	)
 }
@@ -68,6 +75,8 @@ func listDocumentsTool() mcp.Tool {
 		mcp.WithString("keyword", mcp.Description("Optional substring to filter document titles")),
 		mcp.WithNumber("page", mcp.Description("1-based page number, default 1")),
 		mcp.WithNumber("page_size", mcp.Description("Documents per page, default 20, max 100")),
+		mcp.WithString("knowledge_context_handle", mcp.Description("Portal-issued session capability; supplied only by the governed runtime")),
+		mcp.WithString("knowledge_employee_name", mcp.Description("Server-selected employee name; supplied only by the governed runtime")),
 		mcp.WithReadOnlyHintAnnotation(true),
 	)
 }
@@ -82,6 +91,8 @@ func readDocumentTool() mcp.Tool {
 		mcp.WithNumber("offset", mcp.Description("Chunk offset to start from, default 0")),
 		mcp.WithNumber("limit", mcp.Description("Number of chunks to return, default 20, max 100")),
 		mcp.WithString("query", mcp.Description("Optional case-insensitive phrase to find inside the document")),
+		mcp.WithString("knowledge_context_handle", mcp.Description("Portal-issued session capability; supplied only by the governed runtime")),
+		mcp.WithString("knowledge_employee_name", mcp.Description("Server-selected employee name; supplied only by the governed runtime")),
 		mcp.WithReadOnlyHintAnnotation(true),
 	)
 }
@@ -114,14 +125,24 @@ func summarizeKnowledgeBase(kb *types.KnowledgeBase) knowledgeBaseSummary {
 	}
 }
 
-func (s *Server) handleListKnowledgeBases(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleListKnowledgeBases(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ep, err := endpointFromContext(ctx)
 	if err != nil {
 		return mcp.NewToolResultError("unauthorized"), nil
 	}
-	kbs, err := s.allowedKnowledgeBases(ctx, ep)
+	requested := req.GetStringSlice("knowledge_base_ids", nil)
+	var kbs []*types.KnowledgeBase
+	if len(requested) > 0 {
+		kbs, err = s.selectKnowledgeBases(ctx, ep, requested)
+	} else {
+		kbs, err = s.allowedKnowledgeBases(ctx, ep)
+	}
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("failed to list knowledge bases", err), nil
+	}
+	kbs, err = s.portalScopeKnowledgeBases(ctx, req, kbs, false)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 	out := make([]knowledgeBaseSummary, 0, len(kbs))
 	for _, kb := range kbs {
@@ -139,7 +160,12 @@ func (s *Server) handleSearchKnowledge(ctx context.Context, req mcp.CallToolRequ
 	if err != nil || strings.TrimSpace(query) == "" {
 		return mcp.NewToolResultError("query is required"), nil
 	}
-	kbs, err := s.selectKnowledgeBases(ctx, ep, req.GetStringSlice("knowledge_base_ids", nil))
+	requested := req.GetStringSlice("knowledge_base_ids", nil)
+	kbs, err := s.selectKnowledgeBases(ctx, ep, requested)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	kbs, err = s.portalScopeKnowledgeBases(ctx, req, kbs, len(requested) > 0)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -191,7 +217,12 @@ func (s *Server) handleGrepChunks(ctx context.Context, req mcp.CallToolRequest) 
 	if err != nil || strings.TrimSpace(query) == "" {
 		return mcp.NewToolResultError("query is required"), nil
 	}
-	kbs, err := s.selectKnowledgeBases(ctx, ep, req.GetStringSlice("knowledge_base_ids", nil))
+	requested := req.GetStringSlice("knowledge_base_ids", nil)
+	kbs, err := s.selectKnowledgeBases(ctx, ep, requested)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	kbs, err = s.portalScopeKnowledgeBases(ctx, req, kbs, len(requested) > 0)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -283,6 +314,11 @@ func (s *Server) handleListDocuments(ctx context.Context, req mcp.CallToolReques
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	kb := kbs[0]
+	kbs, err = s.portalScopeKnowledgeBases(ctx, req, kbs, true)
+	if err != nil || len(kbs) != 1 {
+		return mcp.NewToolResultError("knowledge access denied"), nil
+	}
+	kb = kbs[0]
 	// Documents live under the knowledge base owner; run the listing there.
 	ctx, err = s.scopedKBContext(ctx, kb, types.OrgRoleViewer)
 	if err != nil {
@@ -335,6 +371,11 @@ func (s *Server) handleReadDocument(ctx context.Context, req mcp.CallToolRequest
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	filtered, err := s.portalScopeKnowledgeBases(ctx, req, []*types.KnowledgeBase{kb}, true)
+	if err != nil || len(filtered) != 1 {
+		return mcp.NewToolResultError("knowledge access denied"), nil
+	}
+	kb = filtered[0]
 	ctx, err = s.scopedKBContext(ctx, kb, types.OrgRoleViewer)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil

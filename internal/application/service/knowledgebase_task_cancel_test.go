@@ -201,7 +201,8 @@ func TestProcessKBDeleteRepeatsQueueCleanup(t *testing.T) {
 
 type populatedKBKnowledgeRepo struct {
 	interfaces.KnowledgeRepository
-	items []*types.Knowledge
+	items       []*types.Knowledge
+	deleteCalls *int
 }
 
 func (r populatedKBKnowledgeRepo) ListKnowledgeByKnowledgeBaseID(
@@ -212,24 +213,108 @@ func (r populatedKBKnowledgeRepo) ListKnowledgeByKnowledgeBaseID(
 	return r.items, nil
 }
 
-func (populatedKBKnowledgeRepo) DeleteKnowledgeList(context.Context, uint64, []string) error {
+func (r populatedKBKnowledgeRepo) DeleteKnowledgeList(context.Context, uint64, []string) error {
+	if r.deleteCalls != nil {
+		*r.deleteCalls = *r.deleteCalls + 1
+	}
 	return nil
 }
 
 type kbCleanupChunkRepo struct {
 	interfaces.ChunkRepository
+	imageInfoErr error
+	deleteCalls  *int
+	deleteErrFor string
+	imageRows    []interfaces.ChunkImageInfo
 }
 
-func (kbCleanupChunkRepo) ListImageInfoByKnowledgeIDs(
+func (r kbCleanupChunkRepo) ListImageInfoByKnowledgeIDs(
 	context.Context,
 	uint64,
 	[]string,
 ) ([]interfaces.ChunkImageInfo, error) {
-	return nil, nil
+	return r.imageRows, r.imageInfoErr
 }
 
-func (kbCleanupChunkRepo) DeleteChunksByKnowledgeID(context.Context, uint64, string) error {
+func (r kbCleanupChunkRepo) DeleteChunksByKnowledgeID(_ context.Context, _ uint64, knowledgeID string) error {
+	if r.deleteCalls != nil {
+		*r.deleteCalls = *r.deleteCalls + 1
+	}
+	if knowledgeID == r.deleteErrFor {
+		return errors.New("chunk deletion failed for " + knowledgeID)
+	}
 	return nil
+}
+
+type kbCleanupResourceCatalogStub struct {
+	interfaces.ResourceCatalog
+	releases []types.ResourceBinding
+}
+
+func (s *kbCleanupResourceCatalogStub) Release(_ context.Context, reference, ownerType, ownerID string) (int64, error) {
+	s.releases = append(s.releases, types.ResourceBinding{ResourceID: reference, OwnerType: ownerType, OwnerID: ownerID})
+	return 1, nil
+}
+
+func TestProcessKBDeletePreservesChunksWhenImageReferencesCannotBeRead(t *testing.T) {
+	const kbID = "kb-image-info-fail"
+	deleteCalls := 0
+	imageErr := errors.New("image-info query failed")
+	svc := &knowledgeBaseService{
+		kgRepo: populatedKBKnowledgeRepo{items: []*types.Knowledge{
+			{ID: "k1", KnowledgeBaseID: kbID, EmbeddingModelID: "m1"},
+		}},
+		chunkRepo:     kbCleanupChunkRepo{imageInfoErr: imageErr, deleteCalls: &deleteCalls},
+		modelService:  kbCleanupModelService{},
+		taskInspector: &recordingKBTaskInspector{},
+	}
+
+	err := svc.ProcessKBDelete(context.Background(), kbDeletePayload(t, kbID, 1))
+	require.ErrorIs(t, err, imageErr)
+	require.Zero(t, deleteCalls, "failed image reference enumeration must leave chunks for task retry")
+}
+
+func TestProcessKBDeletePartialChunkFailureRetainsParentRowsAndReleasesOnlyDeletedBindings(t *testing.T) {
+	const kbID = "kb-partial-chunk-delete"
+	deleteCalls := 0
+	knowledgeDeleteCalls := 0
+	catalog := &kbCleanupResourceCatalogStub{}
+	files := &documentFileSpy{}
+	firstRef := types.BuildResourcePath("abcdefghijklmnopqrstuv")
+	secondRef := types.BuildResourcePath("bcdefghijklmnopqrstuvw")
+	svc := &knowledgeBaseService{
+		kgRepo: populatedKBKnowledgeRepo{
+			items: []*types.Knowledge{
+				{ID: "k1", KnowledgeBaseID: kbID, FilePath: "source-k1"},
+				{ID: "k2", KnowledgeBaseID: kbID, FilePath: "source-k2"},
+			},
+			deleteCalls: &knowledgeDeleteCalls,
+		},
+		chunkRepo: kbCleanupChunkRepo{
+			deleteCalls:  &deleteCalls,
+			deleteErrFor: "k2",
+			imageRows: []interfaces.ChunkImageInfo{
+				{ChunkID: "chunk-1", KnowledgeID: "k1", ImageInfo: `[{"url":"` + firstRef + `"}]`},
+				{ChunkID: "chunk-2", KnowledgeID: "k2", ImageInfo: `[{"url":"` + secondRef + `"}]`},
+			},
+		},
+		resourceCatalog: catalog,
+		fileSvc:         files,
+		modelService:    kbCleanupModelService{},
+		taskInspector:   &recordingKBTaskInspector{},
+	}
+
+	err := svc.ProcessKBDelete(context.Background(), kbDeletePayload(t, kbID, 1))
+	require.ErrorContains(t, err, "chunk deletion failed for k2")
+	require.Equal(t, 2, deleteCalls)
+	require.Zero(t, knowledgeDeleteCalls, "knowledge rows must remain until every chunk delete succeeds")
+	require.Empty(t, files.deleted, "original source files must remain until every chunk delete succeeds")
+	require.Equal(t, []types.ResourceBinding{
+		{ResourceID: firstRef, OwnerType: types.ResourceOwnerKnowledgeChunk, OwnerID: "chunk-1"},
+		// Extracted-image provenance is a separate knowledge_image owner
+		// (relation=extracted_image); never release the source-file knowledge owner.
+		{ResourceID: firstRef, OwnerType: types.ResourceOwnerKnowledgeImage, OwnerID: "k1"},
+	}, catalog.releases, "only chunk-image and extracted-image marker owners for successfully deleted documents are released")
 }
 
 type kbCleanupModelService struct {

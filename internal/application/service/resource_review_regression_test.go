@@ -118,6 +118,44 @@ func TestSharedChunkReadPropagatesStorageFailure(t *testing.T) {
 	require.Nil(t, rows)
 }
 
+func TestUpdateImageInfoDoesNotLeaveBindingWhenChunkWriteFails(t *testing.T) {
+	f := newDocumentWriteFixture(t)
+	catalog, resourceDB := newResourceCatalogForTest(t)
+	// The provenance lookup joins the resource marker to a live knowledge
+	// document and KB. Keep these rows in the resource catalog's DB so this
+	// test reaches the intended chunk-write failure instead of failing the
+	// newly enforced source check with a missing-table error.
+	require.NoError(t, resourceDB.AutoMigrate(&types.Knowledge{}, &types.KnowledgeBase{}))
+	require.NoError(t, resourceDB.Create(&types.KnowledgeBase{ID: "kb", TenantID: 7}).Error)
+	require.NoError(t, resourceDB.Create(&types.Knowledge{
+		ID: "doc", TenantID: 7, KnowledgeBaseID: "kb", ParseStatus: types.ParseStatusCompleted,
+	}).Error)
+	ref, err := catalog.Register(f.ctx, 7, "local://7/exports/update-image.png", interfaces.ResourceRegistration{Kind: "image"})
+	require.NoError(t, err)
+	require.NoError(t, catalog.Bind(f.ctx, ref, types.ResourceOwnerKnowledgeImage, "doc", types.ResourceRelationExtractedImage))
+	f.svc.resourceCatalog = catalog
+	f.chunkRepo.updateErr = errors.New("chunk update failed")
+	imageInfo, err := json.Marshal([]types.ImageInfo{{URL: ref, OriginalURL: ref, Caption: "caption"}})
+	require.NoError(t, err)
+
+	err = f.svc.UpdateImageInfo(f.ctx, "doc", "chunk", string(imageInfo))
+	require.ErrorIs(t, err, f.chunkRepo.updateErr)
+
+	resource, err := catalog.Resolve(f.ctx, ref)
+	require.NoError(t, err)
+	var chunkBindingCount int64
+	require.NoError(t, resourceDB.Model(&types.ResourceBinding{}).
+		Where("resource_id = ? AND owner_type = ?", resource.ID, types.ResourceOwnerKnowledgeChunk).
+		Count(&chunkBindingCount).Error)
+	require.Zero(t, chunkBindingCount, "failed chunk persistence must not leave a chunk-image binding under any chunk owner id")
+	var provenanceMarkerCount int64
+	require.NoError(t, resourceDB.Model(&types.ResourceBinding{}).
+		Where("resource_id = ? AND owner_type = ? AND owner_id = ? AND relation = ?", resource.ID,
+			types.ResourceOwnerKnowledgeImage, "doc", types.ResourceRelationExtractedImage).
+		Count(&provenanceMarkerCount).Error)
+	require.EqualValues(t, 1, provenanceMarkerCount, "failed chunk persistence must preserve the source document's legitimate provenance marker")
+}
+
 func TestFAQCloneDoesNotInheritTransferState(t *testing.T) {
 	f := transferFixture(t, access.KBTransferClone)
 	kb := &types.KnowledgeBase{ID: "new-faq", TenantID: 7}

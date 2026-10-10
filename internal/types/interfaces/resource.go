@@ -79,6 +79,24 @@ type KBResourceLookup interface {
 	IsReferencedByKnowledgeBase(ctx context.Context, tenantID uint64, kbID, reference string) (bool, error)
 }
 
+// KnowledgeChunkImageCatalog resolves and authorizes one registered image
+// against the exact active KB/document/chunk binding.
+type KnowledgeChunkImageCatalog interface {
+	IsKnowledgeChunkImage(ctx context.Context, tenantID uint64, kbID, knowledgeID, chunkID, reference string) (bool, error)
+}
+
+// ExtractedKnowledgeImageLookup verifies provenance written by the trusted
+// server-side parser, not a caller-supplied attachment or chunk binding.
+type ExtractedKnowledgeImageLookup interface {
+	IsExtractedImageForKnowledge(ctx context.Context, tenantID uint64, kbID, knowledgeID, reference string) (bool, error)
+}
+
+// ResourceBindingLookup checks whether an exact owner relation existed before
+// a transfer operation, so rollback never removes a shared pre-existing claim.
+type ResourceBindingLookup interface {
+	HasBinding(ctx context.Context, reference, ownerType, ownerID, relation string) (bool, error)
+}
+
 // MessageFileBindingLookup resolves explicit KB and message-artifact bindings.
 // Only the catalog can turn a raw locator into a registered resource identity.
 type MessageFileBindingLookup interface {

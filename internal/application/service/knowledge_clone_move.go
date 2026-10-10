@@ -296,10 +296,17 @@ func (s *knowledgeService) CloneChunk(ctx context.Context, src, dst *types.Knowl
 					return
 				}
 			}
+			imageRows, imageErr := s.chunkRepo.ListImageInfoByKnowledgeIDs(ctx, dst.TenantID, []string{dst.ID})
+			if imageErr != nil {
+				err = errors.Join(err, fmt.Errorf("read failed clone image bindings: %w", imageErr))
+				return
+			}
 			if cleanupErr := s.chunkRepo.DeleteChunksByKnowledgeID(ctx, dst.TenantID, dst.ID); cleanupErr != nil {
 				err = errors.Join(err, fmt.Errorf("clean failed clone chunks: %w", cleanupErr))
 				return
 			}
+			releaseChunkImageResources(ctx, s.resourceCatalog, dstSvc, imageRows, []string{dst.ID})
+			copiedURLs = nil
 		}
 		cleanupCopiedObjects(ctx, dstSvc, copiedURLs)
 	}()
@@ -391,6 +398,11 @@ func (s *knowledgeService) CloneChunk(ctx context.Context, src, dst *types.Knowl
 		err := s.chunkRepo.CreateChunks(ctx, chunks)
 		if err != nil {
 			return err
+		}
+		for _, chunk := range chunks {
+			if err := bindTransferredChunkImageInfo(ctx, s.resourceCatalog, dst.TenantID, dst.ID, chunk.ID, chunk.ImageInfo); err != nil {
+				return fmt.Errorf("bind cloned chunk images: %w", err)
+			}
 		}
 	}
 
@@ -853,6 +865,32 @@ func (s *knowledgeService) cloneFAQKnowledgeBase(
 			logger.Errorf(ctx, "Failed to create FAQ chunks: %v", err)
 			handleError(progress, err, "Failed to create FAQ entries")
 			return err
+		}
+		for _, chunk := range newChunks {
+			if err := bindTransferredChunkImageInfo(ctx, s.resourceCatalog, dstKB.TenantID, dstKnowledge.ID, chunk.ID, chunk.ImageInfo); err != nil {
+				logger.Errorf(ctx, "Failed to bind cloned FAQ images: %v", err)
+				handleError(progress, err, "Failed to bind FAQ images")
+				newChunkIDs := make([]string, 0, len(newChunks))
+				for _, added := range newChunks {
+					newChunkIDs = append(newChunkIDs, added.ID)
+				}
+				cleanupErr := s.chunkRepo.DeleteChunks(ctx, dstKB.TenantID, newChunkIDs)
+				if cleanupErr == nil {
+					rows := make([]interfaces.ChunkImageInfo, 0, len(newChunks))
+					for _, added := range newChunks {
+						rows = append(rows, interfaces.ChunkImageInfo{ChunkID: added.ID, KnowledgeID: added.KnowledgeID, ImageInfo: added.ImageInfo})
+					}
+					releaseChunkImageResources(ctx, s.resourceCatalog, dstSvc, rows, []string{dstKnowledge.ID})
+					copiedImageURLs = nil
+				} else {
+					// Keep copied files while persisted chunks still refer to them;
+					// retaining their bindings allows a later cleanup to retry.
+					copiedImageURLs = nil
+					retErr = errors.Join(err, fmt.Errorf("clean cloned FAQ chunks after image bind failure: %w", cleanupErr))
+					return retErr
+				}
+				return err
+			}
 		}
 
 		// Saved rows now own these images, including when indexing later fails.

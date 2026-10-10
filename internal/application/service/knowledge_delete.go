@@ -463,14 +463,10 @@ func (s *knowledgeService) executeKnowledgeDelete(plan *knowledgeDeletePlan, sin
 	for _, k := range knowledgeList {
 		knowledgeToKB[k.ID] = k.KnowledgeBaseID
 	}
-	kbImageInfos := make(map[string][]string) // kbID → []imageInfo JSON
+	kbImageInfos := make(map[string][]interfaces.ChunkImageInfo) // kbID → chunk image rows
 	for _, ci := range chunkImageInfos {
 		kbID := knowledgeToKB[ci.KnowledgeID]
-		kbImageInfos[kbID] = append(kbImageInfos[kbID], ci.ImageInfo)
-	}
-	kbImageURLs := make(map[string][]string) // kbID → []imageURL (deduplicated)
-	for kbID, infos := range kbImageInfos {
-		kbImageURLs[kbID] = collectImageURLs(ctx, infos)
+		kbImageInfos[kbID] = append(kbImageInfos[kbID], ci)
 	}
 	kbKnowledgeIDs := make(map[string][]string) // kbID → knowledge IDs releasing their claims
 	for _, k := range knowledgeList {
@@ -578,13 +574,13 @@ func (s *knowledgeService) executeKnowledgeDelete(plan *knowledgeDeletePlan, sin
 		storageAdjust -= knowledge.StorageSize
 	}
 	// Delete extracted images per KB
-	for kbID, urls := range kbImageURLs {
+	for kbID, rows := range kbImageInfos {
 		fSvc := kbFileServices[kbID]
 		if fSvc == nil {
-			logger.Warnf(ctx, "No file service for KB %s, skipping %d image deletions", kbID, len(urls))
+			logger.Warnf(ctx, "No file service for KB %s, skipping %d image deletions", kbID, len(rows))
 			continue
 		}
-		deleteExtractedImages(ctx, fSvc, knowledgeResourceOwners(s.resourceCatalog, kbKnowledgeIDs[kbID]...), urls)
+		releaseChunkImageResources(ctx, s.resourceCatalog, fSvc, rows, kbKnowledgeIDs[kbID])
 	}
 	// TenantInfo can be shared by concurrent cleanup branches; update only storage accounting in the repository.
 	if err := s.tenantRepo.AdjustStorageUsed(ctx, tenantInfo.ID, storageAdjust); err != nil {
@@ -663,23 +659,23 @@ func (s *knowledgeService) cleanupKnowledgeResources(ctx context.Context, knowle
 	chunkImageInfos, imgErr := s.chunkService.GetRepository().ListImageInfoByKnowledgeIDs(ctx, tenantInfo.ID, []string{knowledge.ID})
 	if imgErr != nil {
 		logger.GetLogger(ctx).WithField("error", imgErr).Error("Failed to collect image URLs for cleanup")
-		cleanupErr = errors.Join(cleanupErr, imgErr)
+		// Without the owner/reference rows we cannot safely release image
+		// bindings. Keep chunks intact so a later reparse attempt can retry.
+		return errors.Join(cleanupErr, fmt.Errorf("collect chunk image references: %w", imgErr))
 	}
-	var imageInfoStrs []string
-	for _, ci := range chunkImageInfos {
-		imageInfoStrs = append(imageInfoStrs, ci.ImageInfo)
-	}
-	imageURLs := collectImageURLs(ctx, imageInfoStrs)
-
+	chunksDeleted := false
 	if err := s.chunkRepo.DeleteChunksByKnowledgeID(ctx, knowledge.TenantID, knowledge.ID); err != nil {
 		logger.GetLogger(ctx).WithField("error", err).Error("Failed to delete manual knowledge chunks")
 		cleanupErr = errors.Join(cleanupErr, err)
+	} else {
+		chunksDeleted = true
 	}
 
-	// Delete extracted images after chunks are deleted. The claims released
-	// here are re-taken by triggerManualProcessing, which always runs after
-	// this cleanup and re-binds whatever the new body still references.
-	deleteExtractedImages(ctx, fileSvc, knowledgeResourceOwners(s.resourceCatalog, knowledge.ID), imageURLs)
+	// Delete extracted images after chunks are deleted. If row deletion fails,
+	// retain bindings so the next cleanup attempt can still find and release them.
+	if chunksDeleted {
+		releaseChunkImageResources(ctx, s.resourceCatalog, fileSvc, chunkImageInfos, []string{knowledge.ID})
+	}
 
 	namespace := types.NameSpace{KnowledgeBase: knowledge.KnowledgeBaseID, Knowledge: knowledge.ID}
 	if err := s.graphEngine.DelGraph(ctx, []types.NameSpace{namespace}); err != nil {

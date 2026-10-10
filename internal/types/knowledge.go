@@ -159,6 +159,10 @@ type Knowledge struct {
 	Profile *KnowledgeProfile `json:"profile,omitempty" gorm:"column:profile;type:json"`
 	// Enable status of the knowledge
 	EnableStatus string `json:"enable_status"`
+	// ManualDisabled records an explicit user disable independently from the
+	// transient enable_status used while parsing. Background finalizers must
+	// never re-enable a document while this flag is set.
+	ManualDisabled bool `json:"manual_disabled" gorm:"not null;default:false"`
 	// ID of the embedding model
 	EmbeddingModelID string `json:"embedding_model_id"`
 	// File name of the knowledge
