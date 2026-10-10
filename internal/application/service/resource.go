@@ -176,6 +176,31 @@ func (s *resourceCatalog) IsReferencedByKnowledgeBase(
 	return s.repo.IsReferencedByKnowledgeBase(ctx, tenantID, kbID, resource.ID)
 }
 
+func (s *resourceCatalog) IsKnowledgeChunkImage(
+	ctx context.Context, tenantID uint64, kbID, knowledgeID, chunkID, reference string,
+) (bool, error) {
+	physical, resource, err := s.ResolvePath(ctx, reference)
+	if err != nil {
+		return false, err
+	}
+	if resource == nil {
+		resource, err = s.repo.GetByTenantLocation(ctx, tenantID, resourceLocationHash(physical))
+		if err != nil {
+			return false, err
+		}
+	}
+	if resource == nil || resource.TenantID != tenantID || resource.Kind != "image" || resource.State != types.ResourceStateActive {
+		return false, nil
+	}
+	lookup, ok := s.repo.(interface {
+		IsKnowledgeChunkImage(context.Context, uint64, string, string, string, string) (bool, error)
+	})
+	if !ok {
+		return false, fmt.Errorf("resource repository does not support chunk image authorization")
+	}
+	return lookup.IsKnowledgeChunkImage(ctx, tenantID, kbID, knowledgeID, chunkID, resource.ID)
+}
+
 // GetMessageFileBindings resolves registered aliases before reading authoritative origins.
 func (s *resourceCatalog) GetMessageFileBindings(
 	ctx context.Context, tenantID uint64, reference, messageID string,

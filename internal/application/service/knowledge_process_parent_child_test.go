@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/models/embedding"
@@ -30,11 +31,19 @@ func (r *parentChildKnowledgeRepo) UpdateKnowledge(
 
 type parentChildChunkService struct {
 	interfaces.ChunkRepository
-	created []*types.Chunk
+	created      []*types.Chunk
+	imageInfoErr error
+	deleteErr    error
+	deleteCalls  int
 }
 
 func (s *parentChildChunkService) DeleteChunksByKnowledgeID(context.Context, uint64, string) error {
-	return nil
+	s.deleteCalls++
+	return s.deleteErr
+}
+
+func (s *parentChildChunkService) ListImageInfoByKnowledgeIDs(context.Context, uint64, []string) ([]interfaces.ChunkImageInfo, error) {
+	return nil, s.imageInfoErr
 }
 
 func (s *parentChildChunkService) CreateChunks(_ context.Context, chunks []*types.Chunk) error {
@@ -197,4 +206,40 @@ func TestProcessChunksIndexesEveryTextChild(t *testing.T) {
 		indexedSourceIDs = append(indexedSourceIDs, info.SourceID)
 	}
 	require.ElementsMatch(t, textChunkIDs, indexedSourceIDs)
+}
+
+func TestProcessChunksPreservesExistingRowsWhenImageReferencesCannotBeRead(t *testing.T) {
+	knowledge := &types.Knowledge{
+		ID: "knowledge-1", TenantID: 1, KnowledgeBaseID: "kb-1", ParseStatus: types.ParseStatusProcessing,
+	}
+	chunkService := &parentChildChunkService{imageInfoErr: errors.New("temporary database failure")}
+	service := &knowledgeService{
+		repo:      &parentChildKnowledgeRepo{knowledge: knowledge},
+		chunkRepo: chunkService,
+	}
+	service.processChunks(context.Background(), &types.KnowledgeBase{ID: "kb-1", TenantID: 1}, knowledge,
+		[]types.ParsedChunk{{Content: "new content", Seq: 0}}, ProcessChunksOptions{})
+
+	require.Zero(t, chunkService.deleteCalls, "existing chunks must remain so their image bindings can be retried")
+	require.Empty(t, chunkService.created, "new chunks must not be written after cleanup preflight fails")
+	require.Equal(t, types.ParseStatusFailed, knowledge.ParseStatus)
+	require.Equal(t, "failed to collect existing chunk image references", knowledge.ErrorMessage)
+}
+
+func TestProcessChunksStopsWhenExistingChunkDeletionFails(t *testing.T) {
+	knowledge := &types.Knowledge{
+		ID: "knowledge-1", TenantID: 1, KnowledgeBaseID: "kb-1", ParseStatus: types.ParseStatusProcessing,
+	}
+	chunkService := &parentChildChunkService{deleteErr: errors.New("chunk delete failed")}
+	service := &knowledgeService{
+		repo:      &parentChildKnowledgeRepo{knowledge: knowledge},
+		chunkRepo: chunkService,
+	}
+	service.processChunks(context.Background(), &types.KnowledgeBase{ID: "kb-1", TenantID: 1}, knowledge,
+		[]types.ParsedChunk{{Content: "new content", Seq: 0}}, ProcessChunksOptions{})
+
+	require.Equal(t, 1, chunkService.deleteCalls)
+	require.Empty(t, chunkService.created, "new chunks must not be appended to uncleared rows")
+	require.Equal(t, types.ParseStatusFailed, knowledge.ParseStatus)
+	require.Equal(t, "failed to remove existing chunks before reprocessing", knowledge.ErrorMessage)
 }

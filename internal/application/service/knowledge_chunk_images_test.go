@@ -1,0 +1,248 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"io"
+	"strings"
+	"testing"
+
+	"github.com/Tencent/WeKnora/internal/application/repository"
+	werrors "github.com/Tencent/WeKnora/internal/errors"
+	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/stretchr/testify/require"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+)
+
+type imageKBServiceStub struct {
+	interfaces.KnowledgeBaseService
+	kb *types.KnowledgeBase
+}
+
+func (s imageKBServiceStub) GetKnowledgeBaseByID(context.Context, string) (*types.KnowledgeBase, error) {
+	return s.kb, nil
+}
+
+type imageFileServiceStub struct {
+	interfaces.FileService
+	reads []string
+}
+
+type imageResolveErrorCatalog struct {
+	interfaces.ResourceCatalog
+	ref string
+}
+
+func (c imageResolveErrorCatalog) Resolve(ctx context.Context, ref string) (*types.StoredResource, error) {
+	if ref == c.ref {
+		return nil, errors.New("catalog temporarily unavailable")
+	}
+	return c.ResourceCatalog.Resolve(ctx, ref)
+}
+
+func (s *imageFileServiceStub) GetFile(_ context.Context, path string) (io.ReadCloser, error) {
+	s.reads = append(s.reads, path)
+	return io.NopCloser(strings.NewReader("image-bytes")), nil
+}
+
+func newChunkImageServiceFixture(t *testing.T, bind bool) (*knowledgeService, context.Context, *imageFileServiceStub, string) {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&types.Knowledge{}, &types.KnowledgeBase{}, &types.Chunk{}, &types.StoredResource{}, &types.ResourceBinding{}, &types.ResourceAccessGrant{}))
+	catalog := NewResourceCatalog(repository.NewResourceRepository(db))
+	ref, err := catalog.Register(context.Background(), 7, "local://7/exports/diagram.png", interfaces.ResourceRegistration{Kind: "image", OriginalName: "diagram.png"})
+	require.NoError(t, err)
+	knowledge := &types.Knowledge{ID: "doc", TenantID: 7, KnowledgeBaseID: "kb", ParseStatus: types.ParseStatusCompleted}
+	require.NoError(t, db.Create(knowledge).Error)
+	require.NoError(t, db.Create(&types.KnowledgeBase{ID: "kb", TenantID: 7}).Error)
+	require.NoError(t, db.Create(&types.Chunk{ID: "chunk", TenantID: 7, KnowledgeBaseID: "kb", KnowledgeID: "doc", ImageInfo: `[{"url":"` + ref + `"}]`}).Error)
+	if bind {
+		require.NoError(t, catalog.Bind(context.Background(), ref, types.ResourceOwnerKnowledgeChunk, "chunk", types.ResourceRelationChunkImage))
+	}
+	files := &imageFileServiceStub{}
+	svc := &knowledgeService{
+		repo: repository.NewKnowledgeRepository(db), chunkRepo: repository.NewChunkRepository(db),
+		kbService:       imageKBServiceStub{kb: &types.KnowledgeBase{ID: "kb", TenantID: 7}},
+		resourceCatalog: catalog, fileSvc: files,
+	}
+	return svc, types.WithExecutionTenant(context.Background(), 7), files, ref
+}
+
+type lifecycleKnowledgeRepositoryStub struct {
+	interfaces.KnowledgeRepository
+	knowledge *types.Knowledge
+	changed   bool
+	setCalls  int
+}
+
+func (r *lifecycleKnowledgeRepositoryStub) GetKnowledgeByID(context.Context, uint64, string) (*types.Knowledge, error) {
+	return r.knowledge, nil
+}
+
+func (r *lifecycleKnowledgeRepositoryStub) SetKnowledgeEnabled(_ context.Context, _ uint64, _ string, enabled bool) (bool, error) {
+	r.setCalls++
+	if enabled {
+		r.knowledge.ManualDisabled = false
+		r.knowledge.EnableStatus = "enabled"
+	} else {
+		r.knowledge.ManualDisabled = true
+		r.knowledge.EnableStatus = "disabled"
+	}
+	r.changed = true
+	return true, nil
+}
+
+func TestSetKnowledgeEnabledRejectsEnableBeforeCompleted(t *testing.T) {
+	repo := &lifecycleKnowledgeRepositoryStub{knowledge: &types.Knowledge{
+		ID: "doc", TenantID: 7, ParseStatus: types.ParseStatusProcessing, EnableStatus: "disabled",
+	}}
+	svc := &knowledgeService{repo: repo}
+	ctx := types.WithExecutionTenant(context.Background(), 7)
+
+	got, err := svc.SetKnowledgeEnabled(ctx, "doc", true)
+	require.Nil(t, got)
+	require.Error(t, err)
+	_, isAppError := werrors.IsAppError(err)
+	require.True(t, isAppError)
+	require.Equal(t, 0, repo.setCalls, "invalid enable must not reach repository mutation")
+}
+
+func TestSetKnowledgeEnabledPersistsManualDisableWhileProcessing(t *testing.T) {
+	repo := &lifecycleKnowledgeRepositoryStub{knowledge: &types.Knowledge{
+		ID: "doc", TenantID: 7, ParseStatus: types.ParseStatusProcessing, EnableStatus: "enabled",
+	}}
+	svc := &knowledgeService{repo: repo}
+	ctx := types.WithExecutionTenant(context.Background(), 7)
+
+	got, err := svc.SetKnowledgeEnabled(ctx, "doc", false)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.True(t, got.ManualDisabled)
+	require.Equal(t, "disabled", got.EnableStatus)
+	require.Equal(t, 1, repo.setCalls)
+}
+
+func TestGetKnowledgeChunkImageRejectsDocumentBeingDeleted(t *testing.T) {
+	repo := &lifecycleKnowledgeRepositoryStub{knowledge: &types.Knowledge{
+		ID: "doc", TenantID: 7, KnowledgeBaseID: "kb", ParseStatus: types.ParseStatusDeleting,
+	}}
+	svc := &knowledgeService{repo: repo}
+	ctx := types.WithExecutionTenant(context.Background(), 7)
+
+	reader, _, err := svc.GetKnowledgeChunkImage(ctx, "doc", "chunk", 0)
+	require.Nil(t, reader)
+	require.Error(t, err)
+}
+
+func TestGetKnowledgeChunkImageServesAuthorizedBoundImage(t *testing.T) {
+	svc, ctx, files, _ := newChunkImageServiceFixture(t, true)
+	reader, filename, err := svc.GetKnowledgeChunkImage(ctx, "doc", "chunk", 0)
+	require.NoError(t, err)
+	require.Equal(t, "diagram.png", filename)
+	data, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.NoError(t, reader.Close())
+	require.Equal(t, "image-bytes", string(data))
+	require.Equal(t, []string{"local://7/exports/diagram.png"}, files.reads)
+}
+
+func TestGetKnowledgeChunkImageRejectsMissingBinding(t *testing.T) {
+	svc, ctx, files, _ := newChunkImageServiceFixture(t, false)
+	reader, filename, err := svc.GetKnowledgeChunkImage(ctx, "doc", "chunk", 0)
+	require.Error(t, err)
+	require.Nil(t, reader)
+	require.Empty(t, filename)
+	require.Empty(t, files.reads, "unbound resource must not reach storage")
+}
+
+func TestLegacyImageMetadataWriteDoesNotGrantDownloadBinding(t *testing.T) {
+	err := bindChunkImageResourceIfStored(context.Background(), nil, 7, "chunk", "https://example.invalid/image.png")
+	require.NoError(t, err, "legacy external metadata remains writable, but is not made into a catalog grant")
+	require.NoError(t, bindChunkImageResourceIfStored(context.Background(), nil, 7, "chunk", "resource://abcdefghijklmnopqrstuv"),
+		"a catalog-less deployment preserves resource metadata without granting it")
+}
+
+func TestLegacyChunkImageCleanupNeverDeletesRawProviderPath(t *testing.T) {
+	fileService := &countingFileService{}
+	rows := []interfaces.ChunkImageInfo{{
+		ChunkID:   "chunk",
+		ImageInfo: `[{"url":"s3://bucket/other-tenant-or-object.png"},{"url":"local://7/unverified.png"}]`,
+	}}
+	releaseChunkImageResources(context.Background(), nil, fileService, rows, []string{"doc"})
+	require.Zero(t, fileService.deleteCalls, "raw provider paths do not prove ownership")
+}
+
+func TestReplacementContentClaimsKeepReusedImageAliveAcrossCleanup(t *testing.T) {
+	catalog, _ := newResourceCatalogForTest(t)
+	ctx := context.Background()
+	ref, err := catalog.Register(ctx, 7, "local://7/exports/reused.png", interfaces.ResourceRegistration{Kind: "image"})
+	require.NoError(t, err)
+	require.NoError(t, catalog.Bind(ctx, ref, types.ResourceOwnerKnowledgeChunk, "old-chunk", types.ResourceRelationChunkImage))
+	require.NoError(t, catalog.Bind(ctx, ref, types.ResourceOwnerKnowledge, "doc", types.ResourceRelationAttachment))
+
+	fileService := &countingFileService{}
+	claims, err := holdContentResourceClaims(ctx, catalog, fileService, 7, "![reused]("+ref+")")
+	require.NoError(t, err)
+	require.Len(t, claims, 1)
+
+	// This is the cleanup sequence used by manual replacement: old chunk and
+	// document owners are released while the temporary claim protects the bytes.
+	releaseChunkImageResources(ctx, catalog, fileService, []interfaces.ChunkImageInfo{{
+		ChunkID: "old-chunk", ImageInfo: `[{"url":"` + ref + `"}]`,
+	}}, []string{"doc"})
+	resource, err := catalog.Resolve(ctx, ref)
+	require.NoError(t, err, "replacement image must survive old-content cleanup")
+	require.NotNil(t, resource)
+	require.Zero(t, fileService.deleteCalls)
+
+	require.NoError(t, bindChunkImageResource(ctx, catalog, 7, "new-chunk", ref))
+	releaseContentResourceClaims(ctx, catalog, fileService, claims)
+	resource, err = catalog.Resolve(ctx, ref)
+	require.NoError(t, err, "new chunk binding must retain reused image after transition claim release")
+	require.NotNil(t, resource)
+	require.Zero(t, fileService.deleteCalls)
+}
+
+func TestReplacementResourceResolveFailureStopsCleanup(t *testing.T) {
+	catalog, _ := newResourceCatalogForTest(t)
+	ctx := context.Background()
+	ref, err := catalog.Register(ctx, 7, "local://7/exports/reused.png", interfaces.ResourceRegistration{Kind: "image"})
+	require.NoError(t, err)
+	require.NoError(t, catalog.Bind(ctx, ref, types.ResourceOwnerKnowledge, "doc", types.ResourceRelationAttachment))
+	fileService := &countingFileService{}
+	cleanupCalled := false
+
+	_, err = holdReplacementResourcesBeforeCleanup(ctx, imageResolveErrorCatalog{ResourceCatalog: catalog, ref: ref},
+		fileService, 7, "![reused]("+ref+")", func() error {
+			cleanupCalled = true
+			return nil
+		})
+	require.Error(t, err)
+	require.False(t, cleanupCalled, "resource lookup failure must stop before destructive cleanup")
+	resource, resolveErr := catalog.Resolve(ctx, ref)
+	require.NoError(t, resolveErr, "pre-existing document resource remains active")
+	require.NotNil(t, resource)
+	require.Zero(t, fileService.deleteCalls)
+}
+
+func TestBindChunkImageInfoPreservesLegacyMetadataWithoutGrantingIt(t *testing.T) {
+	catalog, db := newResourceCatalogForTest(t)
+	ctx := context.Background()
+	ref, err := catalog.Register(ctx, 7, "local://7/exports/image.png", interfaces.ResourceRegistration{Kind: "image"})
+	require.NoError(t, err)
+
+	imageInfo := `[{"url":"https://example.invalid/remote.png"},{"url":"s3://bucket/legacy.png"},{"url":"` + ref + `"}]`
+	require.NoError(t, bindChunkImageInfo(ctx, catalog, 7, "chunk-1", imageInfo))
+
+	resource, err := catalog.Resolve(ctx, ref)
+	require.NoError(t, err)
+	var bindings int64
+	require.NoError(t, db.Model(&types.ResourceBinding{}).
+		Where("resource_id = ? AND owner_type = ? AND owner_id = ? AND relation = ?", resource.ID,
+			types.ResourceOwnerKnowledgeChunk, "chunk-1", types.ResourceRelationChunkImage).
+		Count(&bindings).Error)
+	require.EqualValues(t, 1, bindings, "registered resource handles still receive a binding")
+}

@@ -25,6 +25,25 @@ func (r *resourceRepository) IsReferencedByKnowledgeBase(
 	return count > 0, err
 }
 
+func (r *resourceRepository) IsKnowledgeChunkImage(
+	ctx context.Context, tenantID uint64, kbID, knowledgeID, chunkID, resourceID string,
+) (bool, error) {
+	if tenantID == 0 || kbID == "" || knowledgeID == "" || chunkID == "" || resourceID == "" {
+		return false, nil
+	}
+	var count int64
+	err := r.db.WithContext(ctx).Table("resource_bindings AS b").
+		Joins("JOIN chunks AS c ON c.id = b.owner_id AND c.tenant_id = b.tenant_id").
+		Joins("JOIN knowledges AS k ON k.id = c.knowledge_id AND k.tenant_id = c.tenant_id").
+		Joins("JOIN knowledge_bases AS kb ON kb.id = k.knowledge_base_id AND kb.tenant_id = k.tenant_id AND kb.deleted_at IS NULL").
+		Where("b.resource_id = ? AND b.owner_type = ? AND b.relation = ? AND b.tenant_id = ? "+
+			"AND c.id = ? AND c.knowledge_id = ? AND c.knowledge_base_id = ? AND c.deleted_at IS NULL "+
+			"AND k.id = ? AND k.knowledge_base_id = ? AND k.deleted_at IS NULL AND k.parse_status <> ?",
+			resourceID, types.ResourceOwnerKnowledgeChunk, types.ResourceRelationChunkImage,
+			tenantID, chunkID, knowledgeID, kbID, knowledgeID, kbID, types.ParseStatusDeleting).Count(&count).Error
+	return count > 0, err
+}
+
 func (r *resourceRepository) GetMessageFileBindings(
 	ctx context.Context, tenantID uint64, resourceID, messageID string,
 ) (*types.MessageFileBindings, error) {

@@ -69,3 +69,58 @@ func TestKBFileLegacyTextReferencesDoNotAuthorizeFiles(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, ok)
 }
+
+func TestKnowledgeChunkImageRequiresExactDocumentChunkAndTenantBinding(t *testing.T) {
+	catalog, db := newResourceCatalogForTest(t)
+	require.NoError(t, db.AutoMigrate(&types.KnowledgeBase{}, &types.Knowledge{}, &types.Chunk{}, &types.WikiPage{}))
+	ctx := context.Background()
+	ref, err := catalog.Register(ctx, 7, "local://7/exports/chunk-image.png", interfaces.ResourceRegistration{Kind: "image"})
+	require.NoError(t, err)
+	require.NoError(t, db.Create(&types.KnowledgeBase{ID: "kb", TenantID: 7}).Error)
+	require.NoError(t, db.Create(&types.Knowledge{ID: "doc", TenantID: 7, KnowledgeBaseID: "kb", Type: "file"}).Error)
+	chunk := &types.Chunk{ID: "chunk", TenantID: 7, KnowledgeID: "doc", KnowledgeBaseID: "kb", ImageInfo: `[{"url":"` + ref + `"}]`}
+	require.NoError(t, db.Create(chunk).Error)
+	require.NoError(t, catalog.Bind(ctx, ref, types.ResourceOwnerKnowledgeChunk, chunk.ID, types.ResourceRelationChunkImage))
+	require.NoError(t, catalog.Bind(ctx, ref, "shared_test_owner", "shared", "attachment"))
+
+	lookup := catalog.(interfaces.KnowledgeChunkImageCatalog)
+	for _, tc := range []struct {
+		name, kbID, knowledgeID, chunkID string
+		tenantID                         uint64
+		want                             bool
+	}{
+		{name: "exact owner", tenantID: 7, kbID: "kb", knowledgeID: "doc", chunkID: "chunk", want: true},
+		{name: "cross tenant", tenantID: 8, kbID: "kb", knowledgeID: "doc", chunkID: "chunk"},
+		{name: "wrong KB", tenantID: 7, kbID: "other", knowledgeID: "doc", chunkID: "chunk"},
+		{name: "wrong knowledge", tenantID: 7, kbID: "kb", knowledgeID: "other", chunkID: "chunk"},
+		{name: "wrong chunk", tenantID: 7, kbID: "kb", knowledgeID: "doc", chunkID: "other"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, err := lookup.IsKnowledgeChunkImage(ctx, tc.tenantID, tc.kbID, tc.knowledgeID, tc.chunkID, ref)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, ok)
+		})
+	}
+
+	// Reparse/delete cleanup releases the exact chunk claim but preserves a
+	// shared resource claim. A legacy image_info string alone is not a grant.
+	releaseChunkImageResources(ctx, catalog, nil, []interfaces.ChunkImageInfo{{
+		ChunkID: "chunk", KnowledgeID: "doc", ImageInfo: chunk.ImageInfo,
+	}}, []string{"doc"})
+	ok, err := lookup.IsKnowledgeChunkImage(ctx, 7, "kb", "doc", "chunk", ref)
+	require.NoError(t, err)
+	require.False(t, ok)
+	var remaining int64
+	require.NoError(t, db.Model(&types.ResourceBinding{}).Where("resource_id = ?", func() string {
+		resource, resolveErr := catalog.Resolve(ctx, ref)
+		require.NoError(t, resolveErr)
+		return resource.ID
+	}()).Count(&remaining).Error)
+	require.EqualValues(t, 1, remaining)
+
+	require.NoError(t, db.Model(&types.Knowledge{}).Where("id = ?", "doc").
+		Update("parse_status", types.ParseStatusDeleting).Error)
+	ok, err = lookup.IsKnowledgeChunkImage(ctx, 7, "kb", "doc", "chunk", ref)
+	require.NoError(t, err)
+	require.False(t, ok, "a document in the asynchronous deletion window cannot authorize image reads")
+}

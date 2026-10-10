@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -801,6 +802,124 @@ func (s *knowledgeService) UpdateKnowledge(ctx context.Context, knowledge *types
 	}
 	logger.Infof(ctx, "Knowledge updated successfully, ID: %s", knowledge.ID)
 	return nil
+}
+
+// SetKnowledgeEnabled persists an explicit user choice independently from the
+// temporary disabled state used by parsing. A disable may race any parser
+// finalizer; the repository updates the intent and effective status atomically.
+// Enabling is only legal after a successful parse, so an in-flight reparse can
+// never be enabled midway through indexing.
+func (s *knowledgeService) SetKnowledgeEnabled(
+	ctx context.Context, knowledgeID string, enabled bool,
+) (*types.Knowledge, error) {
+	tenantID := types.MustTenantIDFromContext(ctx)
+	current, err := s.repo.GetKnowledgeByID(ctx, tenantID, knowledgeID)
+	if err != nil {
+		return nil, err
+	}
+	if current == nil {
+		return nil, werrors.NewNotFoundError("knowledge not found")
+	}
+	if current.ParseStatus == types.ParseStatusDeleting {
+		return nil, werrors.NewConflictError("knowledge is being deleted")
+	}
+	if enabled && current.ParseStatus != types.ParseStatusCompleted {
+		return nil, werrors.NewConflictError("only successfully parsed knowledge can be enabled")
+	}
+	repository, ok := s.repo.(interfaces.KnowledgeEnableRepository)
+	if !ok {
+		return nil, fmt.Errorf("knowledge repository does not support atomic enable state")
+	}
+	updated, err := repository.SetKnowledgeEnabled(ctx, tenantID, knowledgeID, enabled)
+	if err != nil {
+		return nil, err
+	}
+	if !updated {
+		latest, readErr := s.repo.GetKnowledgeByID(ctx, tenantID, knowledgeID)
+		if readErr != nil {
+			return nil, readErr
+		}
+		if latest == nil {
+			return nil, werrors.NewNotFoundError("knowledge not found")
+		}
+		if latest.ParseStatus == types.ParseStatusDeleting {
+			return nil, werrors.NewConflictError("knowledge is being deleted")
+		}
+		if enabled && latest.ParseStatus != types.ParseStatusCompleted {
+			return nil, werrors.NewConflictError("only successfully parsed knowledge can be enabled")
+		}
+		return nil, werrors.NewConflictError("knowledge state changed; retry the operation")
+	}
+	return s.repo.GetKnowledgeByID(ctx, tenantID, knowledgeID)
+}
+
+// GetKnowledgeChunkImage serves only a resource handle already recorded in the
+// exact chunk's ImageInfo and backed by a matching active chunk-image binding.
+// The request cannot select a provider path or an external URL.
+func (s *knowledgeService) GetKnowledgeChunkImage(
+	ctx context.Context, knowledgeID, chunkID string, index int,
+) (io.ReadCloser, string, error) {
+	tenantID := types.MustTenantIDFromContext(ctx)
+	knowledge, err := s.repo.GetKnowledgeByID(ctx, tenantID, knowledgeID)
+	if err != nil {
+		return nil, "", err
+	}
+	if knowledge == nil {
+		return nil, "", werrors.NewNotFoundError("knowledge not found")
+	}
+	if knowledge.ParseStatus == types.ParseStatusDeleting {
+		return nil, "", werrors.NewNotFoundError("knowledge not found")
+	}
+	chunk, err := s.chunkRepo.GetChunkByID(ctx, tenantID, chunkID)
+	if err != nil {
+		return nil, "", err
+	}
+	if chunk == nil || chunk.KnowledgeID != knowledge.ID || chunk.KnowledgeBaseID != knowledge.KnowledgeBaseID ||
+		chunk.TenantID != knowledge.TenantID || chunk.DeletedAt.Valid {
+		return nil, "", werrors.NewNotFoundError("knowledge chunk not found")
+	}
+	var images []types.ImageInfo
+	if err := json.Unmarshal([]byte(chunk.ImageInfo), &images); err != nil {
+		return nil, "", werrors.NewNotFoundError("knowledge chunk image not found")
+	}
+	if index < 0 || index >= len(images) {
+		return nil, "", werrors.NewNotFoundError("knowledge chunk image not found")
+	}
+	reference := images[index].URL
+	if _, ok := types.ParseResourcePath(reference); !ok || s.resourceCatalog == nil {
+		return nil, "", werrors.NewNotFoundError("knowledge chunk image not found")
+	}
+	resource, err := s.resourceCatalog.Resolve(ctx, reference)
+	if err != nil || resource == nil || resource.TenantID != tenantID || resource.Kind != "image" ||
+		resource.State != types.ResourceStateActive || resource.PhysicalPath == "" {
+		return nil, "", werrors.NewNotFoundError("knowledge chunk image not found")
+	}
+	lookup, ok := s.resourceCatalog.(interfaces.KnowledgeChunkImageCatalog)
+	if !ok {
+		return nil, "", werrors.NewForbiddenError("chunk image authorization is unavailable")
+	}
+	allowed, err := lookup.IsKnowledgeChunkImage(ctx, tenantID, knowledge.KnowledgeBaseID,
+		knowledge.ID, chunk.ID, reference)
+	if err != nil {
+		return nil, "", err
+	}
+	if !allowed {
+		return nil, "", werrors.NewNotFoundError("knowledge chunk image not found")
+	}
+	kb, err := s.kbService.GetKnowledgeBaseByID(ctx, knowledge.KnowledgeBaseID)
+	if err != nil || kb == nil || kb.TenantID != tenantID {
+		return nil, "", werrors.NewNotFoundError("knowledge base not found")
+	}
+	fileSvc := s.resolveFileServiceForPath(ctx, kb, resource.PhysicalPath)
+	reader, err := fileSvc.GetFile(ctx, resource.PhysicalPath)
+	if err != nil {
+		return nil, "", err
+	}
+	filename := filepath.Base(strings.ReplaceAll(strings.TrimSpace(resource.OriginalName), "\\", "/"))
+	if filename == "." || filename == "" {
+		filename = "image"
+	}
+	return reader, filename, nil
 }
 
 // GetKnowledgeBatch retrieves multiple knowledge entries by their IDs

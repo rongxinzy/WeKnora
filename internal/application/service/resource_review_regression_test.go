@@ -118,6 +118,26 @@ func TestSharedChunkReadPropagatesStorageFailure(t *testing.T) {
 	require.Nil(t, rows)
 }
 
+func TestUpdateImageInfoDoesNotLeaveBindingWhenChunkWriteFails(t *testing.T) {
+	f := newDocumentWriteFixture(t)
+	catalog, resourceDB := newResourceCatalogForTest(t)
+	ref, err := catalog.Register(f.ctx, 7, "local://7/exports/update-image.png", interfaces.ResourceRegistration{Kind: "image"})
+	require.NoError(t, err)
+	f.svc.resourceCatalog = catalog
+	f.chunkRepo.updateErr = errors.New("chunk update failed")
+	imageInfo, err := json.Marshal([]types.ImageInfo{{URL: ref, OriginalURL: ref, Caption: "caption"}})
+	require.NoError(t, err)
+
+	err = f.svc.UpdateImageInfo(f.ctx, "doc", "chunk", string(imageInfo))
+	require.ErrorIs(t, err, f.chunkRepo.updateErr)
+
+	resource, err := catalog.Resolve(f.ctx, ref)
+	require.NoError(t, err)
+	var bindingCount int64
+	require.NoError(t, resourceDB.Model(&types.ResourceBinding{}).Where("resource_id = ?", resource.ID).Count(&bindingCount).Error)
+	require.Zero(t, bindingCount, "failed chunk persistence must not leave a resource owner binding")
+}
+
 func TestFAQCloneDoesNotInheritTransferState(t *testing.T) {
 	f := transferFixture(t, access.KBTransferClone)
 	kb := &types.KnowledgeBase{ID: "new-faq", TenantID: 7}

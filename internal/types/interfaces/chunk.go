@@ -6,8 +6,10 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
-// ChunkImageInfo holds (knowledge_id, image_info) pairs for image cleanup before chunk deletion.
+// ChunkImageInfo identifies a chunk's image_info before deletion so resource
+// claims can be released from the exact chunk owner.
 type ChunkImageInfo struct {
+	ChunkID     string `gorm:"column:id"`
 	KnowledgeID string `gorm:"column:knowledge_id"`
 	ImageInfo   string `gorm:"column:image_info"`
 }

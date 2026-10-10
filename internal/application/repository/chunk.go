@@ -628,7 +628,7 @@ func (r *chunkRepository) ListImageInfoByKnowledgeIDs(
 	var results []interfaces.ChunkImageInfo
 	err := r.db.WithContext(ctx).
 		Model(&types.Chunk{}).
-		Select("knowledge_id, image_info").
+		Select("id, knowledge_id, image_info").
 		Where("tenant_id = ? AND knowledge_id IN ? AND image_info != ''", tenantID, knowledgeIDs).
 		Scan(&results).Error
 	return results, err

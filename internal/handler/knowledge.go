@@ -1552,6 +1552,85 @@ func (h *KnowledgeHandler) PreviewKnowledgeFile(c *gin.Context) {
 	}
 }
 
+type setKnowledgeEnabledRequest struct {
+	Enabled *bool `json:"enabled" binding:"required"`
+}
+
+// SetKnowledgeEnabled changes a document's durable user-managed enable intent.
+// Disabling is allowed while parsing; enabling is accepted only after parsing
+// completed successfully.
+func (h *KnowledgeHandler) SetKnowledgeEnabled(c *gin.Context) {
+	id := secutils.SanitizeForLog(c.Param("id"))
+	if id == "" {
+		c.Error(errors.NewBadRequestError("Knowledge ID cannot be empty"))
+		return
+	}
+	_, ctx, err := h.resolveKnowledgeAndValidateKBAccess(c, id, types.OrgRoleEditor)
+	if err != nil {
+		c.Error(err)
+		return
+	}
+	var req setKnowledgeEnabledRequest
+	if err := c.ShouldBindJSON(&req); err != nil || req.Enabled == nil {
+		c.Error(errors.NewBadRequestError("enabled must be a boolean"))
+		return
+	}
+	lifecycle, ok := h.kgService.(interfaces.KnowledgeLifecycleService)
+	if !ok {
+		c.Error(errors.NewInternalServerError("knowledge lifecycle operation is unavailable"))
+		return
+	}
+	knowledge, err := lifecycle.SetKnowledgeEnabled(ctx, id, *req.Enabled)
+	if err != nil {
+		if appErr, ok := errors.IsAppError(err); ok {
+			c.Error(appErr)
+			return
+		}
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{"knowledge_id": id})
+		c.Error(errors.NewInternalServerError("failed to update knowledge enable status"))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": knowledge})
+}
+
+// DownloadKnowledgeChunkImage serves an image by its index in the stored
+// chunk.ImageInfo. The service independently rechecks document/chunk ownership,
+// active resource registration, and the exact chunk-image binding.
+func (h *KnowledgeHandler) DownloadKnowledgeChunkImage(c *gin.Context) {
+	knowledgeID := secutils.SanitizeForLog(c.Param("id"))
+	chunkID := secutils.SanitizeForLog(c.Param("chunk_id"))
+	index, err := strconv.Atoi(c.Param("index"))
+	if knowledgeID == "" || chunkID == "" || err != nil || index < 0 {
+		c.Error(errors.NewBadRequestError("invalid knowledge chunk image parameters"))
+		return
+	}
+	_, ctx, err := h.resolveKnowledgeAndValidateKBAccess(c, knowledgeID, types.OrgRoleViewer)
+	if err != nil {
+		c.Error(err)
+		return
+	}
+	lifecycle, ok := h.kgService.(interfaces.KnowledgeLifecycleService)
+	if !ok {
+		c.Error(errors.NewInternalServerError("knowledge image service is unavailable"))
+		return
+	}
+	reader, filename, err := lifecycle.GetKnowledgeChunkImage(ctx, knowledgeID, chunkID, index)
+	if err != nil {
+		if appErr, ok := errors.IsAppError(err); ok {
+			c.Error(appErr)
+			return
+		}
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{"knowledge_id": knowledgeID, "chunk_id": chunkID})
+		c.Error(errors.NewNotFoundError("knowledge chunk image not found"))
+		return
+	}
+	if err := filetransport.Serve(c.Writer, c.Request, reader, filetransport.Options{
+		Filename: filename, CacheControl: "private, no-store",
+	}); err != nil {
+		logger.Errorf(ctx, "Failed to stream knowledge chunk image: %v", err)
+	}
+}
+
 // GetKnowledgeBatchRequest defines parameters for batch knowledge retrieval
 type GetKnowledgeBatchRequest struct {
 	IDs                 []string `form:"ids" binding:"required"` // List of knowledge IDs
