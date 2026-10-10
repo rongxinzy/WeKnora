@@ -35,7 +35,7 @@ the next parse. Existing clients and the older retrieval API remain compatible.
 
 ## Chunk image read
 
-`GET /api/v1/knowledge/:knowledge_id/chunks/:chunk_id/images/:index`
+`GET /api/v1/knowledge/:id/chunks/:chunk_id/images/:index`
 
 This is a viewer/read operation under the existing knowledge-base access
 guards. `index` is zero-based and indexes the JSON array persisted in that
