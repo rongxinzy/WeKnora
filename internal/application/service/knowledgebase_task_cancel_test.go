@@ -311,8 +311,10 @@ func TestProcessKBDeletePartialChunkFailureRetainsParentRowsAndReleasesOnlyDelet
 	require.Empty(t, files.deleted, "original source files must remain until every chunk delete succeeds")
 	require.Equal(t, []types.ResourceBinding{
 		{ResourceID: firstRef, OwnerType: types.ResourceOwnerKnowledgeChunk, OwnerID: "chunk-1"},
-		{ResourceID: firstRef, OwnerType: types.ResourceOwnerKnowledge, OwnerID: "k1"},
-	}, catalog.releases, "only bindings owned by successfully deleted chunks are released")
+		// Extracted-image provenance is a separate knowledge_image owner
+		// (relation=extracted_image); never release the source-file knowledge owner.
+		{ResourceID: firstRef, OwnerType: types.ResourceOwnerKnowledgeImage, OwnerID: "k1"},
+	}, catalog.releases, "only chunk-image and extracted-image marker owners for successfully deleted documents are released")
 }
 
 type kbCleanupModelService struct {
