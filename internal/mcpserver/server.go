@@ -12,9 +12,15 @@
 package mcpserver
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"net/url"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,21 +45,34 @@ const (
 
 var errNoEndpoint = errors.New("mcp endpoint missing from request context")
 
+type portalAuditContextKey struct{}
+
+type portalAuditOperation struct {
+	endpoint    string
+	handle      string
+	operationID string
+}
+
+type portalAuditOperations struct{ operations []portalAuditOperation }
+
 // Server wires the tool catalog onto an mcp-go server and exposes it as an
 // http.Handler.
 type Server struct {
-	kbService        interfaces.KnowledgeBaseService
-	knowledgeService interfaces.KnowledgeService
-	chunkService     interfaces.ChunkService
-	wikiService      interfaces.WikiPageService
-	sessionService   interfaces.SessionService
-	messageService   interfaces.MessageService
-	agentService     interfaces.CustomAgentService
-	kbShareService   interfaces.KBShareService
-	tenantService    interfaces.TenantService
-	endpointRepo     interfaces.MCPEndpointRepository
-	db               *gorm.DB
-	cfg              *config.Config
+	kbService                   interfaces.KnowledgeBaseService
+	knowledgeService            interfaces.KnowledgeService
+	chunkService                interfaces.ChunkService
+	wikiService                 interfaces.WikiPageService
+	sessionService              interfaces.SessionService
+	messageService              interfaces.MessageService
+	agentService                interfaces.CustomAgentService
+	kbShareService              interfaces.KBShareService
+	tenantService               interfaces.TenantService
+	endpointRepo                interfaces.MCPEndpointRepository
+	db                          *gorm.DB
+	cfg                         *config.Config
+	portalKnowledgeAuthURL      string
+	portalKnowledgeAuthRequired bool
+	portalKnowledgeAuthClient   *http.Client
 
 	limiter   *ratelimit.Limiter
 	lastTouch sync.Map // endpoint id -> time.Time of the last last_used_at write
@@ -79,19 +98,25 @@ func NewServer(
 	redisClient *redis.Client,
 ) *Server {
 	s := &Server{
-		kbService:        kbService,
-		knowledgeService: knowledgeService,
-		chunkService:     chunkService,
-		wikiService:      wikiService,
-		sessionService:   sessionService,
-		messageService:   messageService,
-		agentService:     agentService,
-		kbShareService:   kbShareService,
-		tenantService:    tenantService,
-		endpointRepo:     endpointRepo,
-		db:               db,
-		cfg:              cfg,
-		limiter:          ratelimit.New(redisClient, rateLimitKeyPrefix, time.Minute, ""),
+		kbService:                   kbService,
+		knowledgeService:            knowledgeService,
+		chunkService:                chunkService,
+		wikiService:                 wikiService,
+		sessionService:              sessionService,
+		messageService:              messageService,
+		agentService:                agentService,
+		kbShareService:              kbShareService,
+		tenantService:               tenantService,
+		endpointRepo:                endpointRepo,
+		db:                          db,
+		cfg:                         cfg,
+		portalKnowledgeAuthURL:      strings.TrimRight(strings.TrimSpace(os.Getenv("PORTAL_KNOWLEDGE_AUTH_URL")), "/"),
+		portalKnowledgeAuthRequired: strings.EqualFold(strings.TrimSpace(os.Getenv("PORTAL_KNOWLEDGE_AUTH_REQUIRED")), "true"),
+		portalKnowledgeAuthClient: &http.Client{
+			Timeout:       5 * time.Second,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
+		},
+		limiter: ratelimit.New(redisClient, rateLimitKeyPrefix, time.Minute, ""),
 	}
 	// The local fallback map only grows without periodic eviction; the server
 	// lives for the whole process so the cleanup goroutine never stops.
@@ -111,6 +136,132 @@ func NewServer(
 		server.WithStateLess(true),
 	)
 	return s
+}
+
+// portalAuthorizedKnowledgeBases rechecks the Portal cookie session and the
+// current AEP user/team grants immediately before a knowledge read. The
+// opaque handle is a per-run capability; it is never accepted from a model
+// as identity by itself because the governance middleware overwrites it.
+func (s *Server) portalAuthorizedKnowledgeBases(ctx context.Context, req mcp.CallToolRequest, requested []string, requireAll bool) ([]string, error) {
+	handle := strings.TrimSpace(req.GetString("knowledge_context_handle", ""))
+	employee := strings.TrimSpace(req.GetString("knowledge_employee_name", ""))
+	if s.portalKnowledgeAuthURL == "" {
+		if s.portalKnowledgeAuthRequired || handle != "" || employee != "" {
+			return nil, errors.New("online knowledge authorization is unavailable")
+		}
+		return nil, nil // explicitly unconfigured legacy MCP server
+	}
+	if handle == "" || len(handle) != 43 || employee == "" || len(employee) > 63 || len(requested) == 0 || len(requested) > 100 {
+		return nil, errors.New("knowledge session context and explicit knowledge-base scope are required")
+	}
+	for _, id := range requested {
+		if id == "" || len(id) > 128 || strings.TrimSpace(id) != id {
+			return nil, errors.New("invalid knowledge-base scope")
+		}
+	}
+	path := "/" + url.PathEscape(employee) + "/authorize"
+	endpoint, err := url.Parse(s.portalKnowledgeAuthURL + path)
+	if err != nil || (endpoint.Scheme != "http" && endpoint.Scheme != "https") || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" {
+		return nil, errors.New("online knowledge authorization is unavailable")
+	}
+	audits, ok := ctx.Value(portalAuditContextKey{}).(*portalAuditOperations)
+	if !ok {
+		return nil, errors.New("online knowledge audit is unavailable")
+	}
+	body, err := json.Marshal(map[string]any{"knowledge_base_ids": requested, "require_all": requireAll, "action": "runtime_read"})
+	if err != nil {
+		return nil, err
+	}
+	call, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
+	if err != nil {
+		return nil, errors.New("online knowledge authorization is unavailable")
+	}
+	call.Header.Set("Content-Type", "application/json")
+	call.Header.Set("X-DeerFlow-Knowledge-Context", handle)
+	client := s.portalKnowledgeAuthClient
+	if client == nil {
+		client = &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+	}
+	response, err := client.Do(call)
+	if err != nil {
+		return nil, errors.New("online knowledge authorization is unavailable")
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return nil, errors.New("knowledge access denied")
+	}
+	var payload struct {
+		KnowledgeBaseIDs []string `json:"knowledge_base_ids"`
+		OperationID      string   `json:"operation_id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, (16<<10)+1)).Decode(&payload); err != nil || payload.KnowledgeBaseIDs == nil || len(payload.KnowledgeBaseIDs) > 100 || payload.OperationID == "" || len(payload.OperationID) > 128 {
+		return nil, errors.New("online knowledge authorization returned an invalid response")
+	}
+	audits.operations = append(audits.operations, portalAuditOperation{endpoint: endpoint.String(), handle: handle, operationID: payload.OperationID})
+	allowed := make(map[string]struct{}, len(payload.KnowledgeBaseIDs))
+	for _, id := range payload.KnowledgeBaseIDs {
+		allowed[id] = struct{}{}
+	}
+	for id := range allowed {
+		found := false
+		for _, candidate := range requested {
+			if candidate == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, errors.New("online knowledge authorization returned an unexpected scope")
+		}
+	}
+	if requireAll && len(allowed) != len(requested) {
+		return nil, errors.New("knowledge access denied")
+	}
+	if len(allowed) == 0 {
+		return nil, errors.New("knowledge access denied")
+	}
+	result := make([]string, 0, len(allowed))
+	for _, id := range requested {
+		if _, ok := allowed[id]; ok {
+			result = append(result, id)
+		}
+	}
+	return result, nil
+}
+
+func (s *Server) completePortalAudits(ctx context.Context, audits *portalAuditOperations, succeeded bool) error {
+	if succeeded && len(audits.operations) == 0 {
+		return errors.New("online knowledge authorization is unavailable")
+	}
+	client := s.portalKnowledgeAuthClient
+	if client == nil {
+		client = &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+	}
+	outcome, status := "failed", http.StatusBadGateway
+	if succeeded {
+		outcome, status = "succeeded", http.StatusOK
+	}
+	for _, operation := range audits.operations {
+		body, err := json.Marshal(map[string]any{"operation_id": operation.operationID, "outcome": outcome, "status_code": status})
+		if err != nil {
+			return err
+		}
+		call, err := http.NewRequestWithContext(ctx, http.MethodPost, operation.endpoint, bytes.NewReader(body))
+		if err != nil {
+			return errors.New("online knowledge audit is unavailable")
+		}
+		call.Header.Set("Content-Type", "application/json")
+		call.Header.Set("X-DeerFlow-Knowledge-Context", operation.handle)
+		response, err := client.Do(call)
+		if err != nil {
+			return errors.New("online knowledge audit is unavailable")
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusNoContent {
+			return errors.New("online knowledge audit is unavailable")
+		}
+	}
+	return nil
 }
 
 // Handler returns the http.Handler to mount under /mcp/:endpoint_id. The
@@ -164,7 +315,26 @@ func (s *Server) guardTool(next server.ToolHandlerFunc) server.ToolHandlerFunc {
 			return mcp.NewToolResultError("rate limit exceeded for this endpoint, retry shortly"), nil
 		}
 		s.touchLastUsed(ctx, ep.ID)
-		return next(ctx, req)
+		governed := s.portalKnowledgeAuthURL != "" || s.portalKnowledgeAuthRequired || req.GetString("knowledge_context_handle", "") != "" || req.GetString("knowledge_employee_name", "") != ""
+		if !governed {
+			return next(ctx, req)
+		}
+		// Synthesis and write tools do not implement this read-only Portal
+		// contract. Never let them bypass the governed read boundary.
+		switch req.Params.Name {
+		case types.MCPEndpointToolListKnowledgeBases, types.MCPEndpointToolSearchKnowledge, types.MCPEndpointToolGrepChunks, types.MCPEndpointToolListDocuments, types.MCPEndpointToolReadDocument, types.MCPEndpointToolWikiSearch, types.MCPEndpointToolWikiReadPage, types.MCPEndpointToolWikiIndex:
+		default:
+			return mcp.NewToolResultError("tool is unavailable for governed knowledge access"), nil
+		}
+		audits := &portalAuditOperations{}
+		result, callErr := next(context.WithValue(ctx, portalAuditContextKey{}, audits), req)
+		succeeded := callErr == nil && result != nil && !result.IsError
+		auditCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := s.completePortalAudits(auditCtx, audits, succeeded); err != nil {
+			return mcp.NewToolResultError("online knowledge audit is unavailable"), nil
+		}
+		return result, callErr
 	}
 }
 
