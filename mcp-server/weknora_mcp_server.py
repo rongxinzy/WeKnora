@@ -44,7 +44,19 @@ except ValueError:
 SSE_MESSAGE_PATH = "/sse/messages/"
 STREAMABLE_HTTP_STATELESS = True
 PORTAL_KNOWLEDGE_AUTH_URL = os.getenv("PORTAL_KNOWLEDGE_AUTH_URL", "").strip().rstrip("/")
-PORTAL_KNOWLEDGE_AUTH_REQUIRED = os.getenv("PORTAL_KNOWLEDGE_AUTH_REQUIRED", "false").strip().lower() == "true"
+
+
+def parse_portal_knowledge_auth_required(value: str) -> bool:
+    """A misspelled enterprise setting must not silently enable legacy access."""
+    normalized = value.strip().lower()
+    if normalized not in {"true", "false"}:
+        raise ValueError("PORTAL_KNOWLEDGE_AUTH_REQUIRED must be true or false")
+    return normalized == "true"
+
+
+PORTAL_KNOWLEDGE_AUTH_REQUIRED = parse_portal_knowledge_auth_required(
+    os.getenv("PORTAL_KNOWLEDGE_AUTH_REQUIRED", "false")
+)
 _EMPLOYEE_NAME_RE = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$", re.ASCII)
 _OPAQUE_CONTEXT_RE = re.compile(r"^[A-Za-z0-9_-]{43}$", re.ASCII)
 
@@ -840,6 +852,35 @@ class WeKnoraClient:
 # MCPServer (formerly FastMCP) builds input schemas from function type hints
 # and serializes plain return values automatically.
 mcp = MCPServer("weknora-server", version="1.1.1")
+
+# The transport credential belongs to the employee runtime, not to the human
+# administrator. Required mode must therefore enforce the product boundary
+# here, even if a caller bypasses the governance middleware entirely.
+_PORTAL_PROTECTED_READ_TOOLS = frozenset({
+    "list_knowledge_bases", "get_knowledge_base", "hybrid_search",
+    "list_knowledge", "get_knowledge", "list_chunks",
+    "wiki_search", "wiki_read_page", "wiki_index_view",
+})
+
+
+def enterprise_tool(function):
+    """Register tools with a default-deny enterprise execution boundary."""
+    def require_protected_read():
+        if PORTAL_KNOWLEDGE_AUTH_REQUIRED and function.__name__ not in _PORTAL_PROTECTED_READ_TOOLS:
+            raise PermissionError("tool is unavailable under required Portal knowledge authorization")
+
+    if asyncio.iscoroutinefunction(function):
+        @functools.wraps(function)
+        async def guarded(*args, **kwargs):
+            require_protected_read()
+            return await function(*args, **kwargs)
+    else:
+        @functools.wraps(function)
+        def guarded(*args, **kwargs):
+            require_protected_read()
+            return function(*args, **kwargs)
+
+    return mcp.tool()(guarded)
 # Initialize WeKnora API client with configuration
 client = WeKnoraClient(WEKNORA_BASE_URL, WEKNORA_API_KEY)
 
@@ -856,7 +897,7 @@ client = WeKnoraClient(WEKNORA_BASE_URL, WEKNORA_API_KEY)
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@enterprise_tool
 def create_tenant(
     name: str,
     description: str,
@@ -873,13 +914,13 @@ def create_tenant(
     return client.create_tenant(name, description, business, engines)
 
 
-@mcp.tool()
+@enterprise_tool
 def list_tenants() -> dict:
     """List all tenants."""
     return client.list_tenants()
 
 
-@mcp.tool()
+@enterprise_tool
 def create_knowledge_base(
     name: str,
     description: str,
@@ -900,7 +941,7 @@ def create_knowledge_base(
     return client.create_knowledge_base(name, description, config)
 
 
-@mcp.tool()
+@enterprise_tool
 def list_knowledge_bases(
     knowledge_base_ids: list[str] | None = None,
     knowledge_employee_name: str = "",
@@ -920,13 +961,13 @@ def list_knowledge_bases(
         return {"data": [kb for kb in _normalize_kb_entries(response) if kb.get("id") in allowed_set], "total": len(allowed_set)}
 
 
-@mcp.tool()
+@enterprise_tool
 def list_shared_knowledge_bases() -> dict:
     """List knowledge bases shared from other workspaces."""
     return client.list_shared_knowledge_bases()
 
 
-@mcp.tool()
+@enterprise_tool
 def get_knowledge_base(
     kb_id: str,
     knowledge_employee_name: str = "",
@@ -938,13 +979,13 @@ def get_knowledge_base(
         return client.get_knowledge_base(allowed_id)
 
 
-@mcp.tool()
+@enterprise_tool
 def delete_knowledge_base(kb_id: str) -> dict:
     """Delete a knowledge base."""
     return client.delete_knowledge_base(kb_id)
 
 
-@mcp.tool()
+@enterprise_tool
 def hybrid_search(
     kb_id: str,
     query: str,
@@ -971,7 +1012,7 @@ def hybrid_search(
         return client.hybrid_search(resolved, query, config)
 
 
-@mcp.tool()
+@enterprise_tool
 def create_knowledge_from_file(
     kb_id: str,
     file_path: str,
@@ -990,7 +1031,7 @@ def create_knowledge_from_file(
     )
 
 
-@mcp.tool()
+@enterprise_tool
 def create_knowledge_from_url(
     kb_id: str,
     url: str,
@@ -1000,7 +1041,7 @@ def create_knowledge_from_url(
     return client.create_knowledge_from_url(kb_id, url, enable_multimodel)
 
 
-@mcp.tool()
+@enterprise_tool
 def create_knowledge_from_text(
     kb_id: str,
     title: str,
@@ -1021,7 +1062,7 @@ def create_knowledge_from_text(
     )
 
 
-@mcp.tool()
+@enterprise_tool
 def update_knowledge_from_text(
     knowledge_id: str,
     content: str,
@@ -1040,7 +1081,7 @@ def update_knowledge_from_text(
     )
 
 
-@mcp.tool()
+@enterprise_tool
 def list_knowledge(
     kb_id: str,
     page: int = 1,
@@ -1063,7 +1104,7 @@ def list_knowledge(
         )
 
 
-@mcp.tool()
+@enterprise_tool
 def get_knowledge(
     knowledge_id: str,
     knowledge_employee_name: str = "",
@@ -1075,13 +1116,13 @@ def get_knowledge(
         return client.get_knowledge(knowledge_id)
 
 
-@mcp.tool()
+@enterprise_tool
 def delete_knowledge(knowledge_id: str) -> dict:
     """Delete a knowledge entry."""
     return client.delete_knowledge(knowledge_id)
 
 
-@mcp.tool()
+@enterprise_tool
 def create_model(
     name: str,
     type: str,
@@ -1096,19 +1137,19 @@ def create_model(
     return client.create_model(name, type, source, description, parameters, is_default)
 
 
-@mcp.tool()
+@enterprise_tool
 def list_models() -> dict:
     """List all models."""
     return client.list_models()
 
 
-@mcp.tool()
+@enterprise_tool
 def get_model(model_id: str) -> dict:
     """Get model details."""
     return client.get_model(model_id)
 
 
-@mcp.tool()
+@enterprise_tool
 def create_session(
     kb_id: str,
     max_rounds: int = 5,
@@ -1133,25 +1174,25 @@ def create_session(
     )
 
 
-@mcp.tool()
+@enterprise_tool
 def get_session(session_id: str) -> dict:
     """Get session details."""
     return client.get_session(session_id)
 
 
-@mcp.tool()
+@enterprise_tool
 def list_sessions(page: int = 1, page_size: int = 20) -> dict:
     """List chat sessions."""
     return client.list_sessions(page, page_size)
 
 
-@mcp.tool()
+@enterprise_tool
 def delete_session(session_id: str) -> dict:
     """Delete a session."""
     return client.delete_session(session_id)
 
 
-@mcp.tool()
+@enterprise_tool
 async def chat(
     session_id: str,
     query: str,
@@ -1181,7 +1222,7 @@ async def chat(
     return await asyncio.get_running_loop().run_in_executor(None, fn)
 
 
-@mcp.tool()
+@enterprise_tool
 async def agent_chat(
     session_id: str,
     query: str,
@@ -1252,7 +1293,7 @@ async def agent_chat(
     return await asyncio.get_running_loop().run_in_executor(None, fn)
 
 
-@mcp.tool()
+@enterprise_tool
 def list_agents(page: int = 1, page_size: int = 50) -> dict:
     """List all custom agents available to the current tenant.
 
@@ -1262,7 +1303,7 @@ def list_agents(page: int = 1, page_size: int = 50) -> dict:
     return client.list_agents(page=page, page_size=page_size)
 
 
-@mcp.tool()
+@enterprise_tool
 def get_agent(agent_id: str) -> dict:
     """Get full configuration of a single agent by UUID or name.
 
@@ -1274,7 +1315,7 @@ def get_agent(agent_id: str) -> dict:
     return client.get_agent(resolved_id)
 
 
-@mcp.tool()
+@enterprise_tool
 def list_chunks(
     knowledge_id: str,
     page: int = 1,
@@ -1289,13 +1330,13 @@ def list_chunks(
         return client.list_chunks(knowledge_id, page, page_size)
 
 
-@mcp.tool()
+@enterprise_tool
 def delete_chunk(knowledge_id: str, chunk_id: str) -> dict:
     """Delete a chunk."""
     return client.delete_chunk(knowledge_id, chunk_id)
 
 
-@mcp.tool()
+@enterprise_tool
 def wiki_search(
     kb_id: str,
     query: str,
@@ -1312,7 +1353,7 @@ def wiki_search(
         return client.wiki_search(allowed_id, query, limit)
 
 
-@mcp.tool()
+@enterprise_tool
 def wiki_read_page(
     kb_id: str,
     slug: str,
@@ -1329,7 +1370,7 @@ def wiki_read_page(
         return client.wiki_read_page(allowed_id, slug)
 
 
-@mcp.tool()
+@enterprise_tool
 def wiki_index_view(
     kb_id: str,
     limit: int = 50,
