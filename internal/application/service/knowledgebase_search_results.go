@@ -337,6 +337,9 @@ func (s *knowledgeBaseService) assembleSearchResults(
 
 		score := idx.scores[chunk.ID]
 		if knowledge, ok := knowledgeMap[chunk.KnowledgeID]; ok {
+			if knowledge == nil || knowledge.ManualDisabled || knowledge.EnableStatus == "disabled" {
+				continue
+			}
 			matchType := idx.matchTypes[chunk.ID]
 			matchedContent := idx.matchedContents[chunk.ID]
 			searchResults = append(searchResults, s.buildSearchResult(chunk, knowledge, score, matchType, matchedContent))
@@ -365,6 +368,9 @@ func (s *knowledgeBaseService) assembleSearchResults(
 			}
 
 			if knowledge, ok := knowledgeMap[chunk.KnowledgeID]; ok {
+				if knowledge == nil || knowledge.ManualDisabled || knowledge.EnableStatus == "disabled" {
+					continue
+				}
 				matchType := types.MatchTypeParentChunk
 				if specificType, exists := idx.matchTypes[chunkID]; exists {
 					matchType = specificType
