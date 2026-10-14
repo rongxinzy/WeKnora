@@ -19,8 +19,9 @@ import (
 // knowledgesTestDDL mirrors the columns of `knowledges` that
 // SetFinalizing / FinalizeSubtask / UpdateKnowledge actually read or write.
 // We inline the DDL (instead of AutoMigrate) so the schema is explicit,
-// and we include pending_subtasks_count from migration 000056 plus the
-// processing/finalizing/completed columns the helpers care about.
+// and we include pending_subtasks_count from migration 000056 and
+// manual_disabled from migration 000104, plus the parse-state columns these
+// helpers update atomically.
 const knowledgesTestDDL = `
 CREATE TABLE IF NOT EXISTS knowledges (
     profile TEXT,
@@ -33,6 +34,7 @@ CREATE TABLE IF NOT EXISTS knowledges (
     source VARCHAR(2048) NOT NULL DEFAULT '',
     parse_status VARCHAR(50) NOT NULL DEFAULT 'unprocessed',
     enable_status VARCHAR(50) NOT NULL DEFAULT 'enabled',
+    manual_disabled BOOLEAN NOT NULL DEFAULT FALSE,
     embedding_model_id VARCHAR(64),
     file_name VARCHAR(255),
     folder_path VARCHAR(1024) NOT NULL DEFAULT '',
@@ -117,6 +119,59 @@ func TestKnowledgeRepository_UpdateKnowledgeColumnsSanitizesErrorMessage(t *test
 		t.Fatalf("persisted error_message is invalid UTF-8: % x", []byte(got))
 	}
 	assert.Equal(t, "parse failed .", got)
+}
+
+func TestKnowledgeRepository_ManualDisableWinsOverStaleUpdateAndFinalizer(t *testing.T) {
+	db := setupKnowledgeTestDB(t)
+	repo := NewKnowledgeRepository(db).(*knowledgeRepository)
+	ctx := context.Background()
+	id := insertProcessingKnowledge(t, db)
+
+	stale, err := repo.GetKnowledgeByID(ctx, 1, id)
+	require.NoError(t, err)
+	changed, err := repo.SetKnowledgeEnabled(ctx, 1, id, false)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	// Simulate an old parser snapshot trying to write its successful status.
+	stale.ParseStatus = types.ParseStatusFinalizing
+	stale.EnableStatus = "enabled"
+	require.NoError(t, repo.UpdateKnowledge(ctx, stale))
+	_, promoted, err := repo.FinalizeSubtask(ctx, id)
+	require.NoError(t, err)
+	require.True(t, promoted)
+
+	var manualDisabled bool
+	var enableStatus, parseStatus string
+	require.NoError(t, db.Raw(`SELECT manual_disabled, enable_status, parse_status FROM knowledges WHERE id = ?`, id).
+		Row().Scan(&manualDisabled, &enableStatus, &parseStatus))
+	assert.True(t, manualDisabled)
+	assert.Equal(t, "disabled", enableStatus)
+	assert.Equal(t, types.ParseStatusCompleted, parseStatus)
+
+	changed, err = repo.SetKnowledgeEnabled(ctx, 1, id, true)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.NoError(t, db.Raw(`SELECT manual_disabled, enable_status FROM knowledges WHERE id = ?`, id).
+		Row().Scan(&manualDisabled, &enableStatus))
+	assert.False(t, manualDisabled)
+	assert.Equal(t, "enabled", enableStatus)
+}
+
+func TestKnowledgeRepository_ManualEnableRequiresCompleted(t *testing.T) {
+	db := setupKnowledgeTestDB(t)
+	repo := NewKnowledgeRepository(db).(*knowledgeRepository)
+	id := insertProcessingKnowledge(t, db)
+
+	changed, err := repo.SetKnowledgeEnabled(context.Background(), 1, id, true)
+	require.NoError(t, err)
+	assert.False(t, changed)
+	var manualDisabled bool
+	var enableStatus string
+	require.NoError(t, db.Raw(`SELECT manual_disabled, enable_status FROM knowledges WHERE id = ?`, id).
+		Row().Scan(&manualDisabled, &enableStatus))
+	assert.False(t, manualDisabled)
+	assert.Equal(t, "enabled", enableStatus)
 }
 
 func insertKnowledgeWithStatus(t *testing.T, db *gorm.DB, status string, deleted bool) string {

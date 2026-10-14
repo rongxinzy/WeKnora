@@ -155,6 +155,20 @@ func (s *resourceCatalog) Bind(ctx context.Context, reference, ownerType, ownerI
 	})
 }
 
+func (s *resourceCatalog) HasBinding(ctx context.Context, reference, ownerType, ownerID, relation string) (bool, error) {
+	resource, err := s.Resolve(ctx, reference)
+	if err != nil || resource == nil {
+		return false, err
+	}
+	lookup, ok := s.repo.(interface {
+		HasBinding(context.Context, string, string, string, string) (bool, error)
+	})
+	if !ok {
+		return false, fmt.Errorf("resource repository cannot verify existing bindings")
+	}
+	return lookup.HasBinding(ctx, resource.ID, ownerType, ownerID, relation)
+}
+
 func (s *resourceCatalog) IsReferencedByKnowledgeBase(
 	ctx context.Context,
 	tenantID uint64,
@@ -174,6 +188,50 @@ func (s *resourceCatalog) IsReferencedByKnowledgeBase(
 		return false, nil
 	}
 	return s.repo.IsReferencedByKnowledgeBase(ctx, tenantID, kbID, resource.ID)
+}
+
+func (s *resourceCatalog) IsKnowledgeChunkImage(
+	ctx context.Context, tenantID uint64, kbID, knowledgeID, chunkID, reference string,
+) (bool, error) {
+	physical, resource, err := s.ResolvePath(ctx, reference)
+	if err != nil {
+		return false, err
+	}
+	if resource == nil {
+		resource, err = s.repo.GetByTenantLocation(ctx, tenantID, resourceLocationHash(physical))
+		if err != nil {
+			return false, err
+		}
+	}
+	if resource == nil || resource.TenantID != tenantID || resource.Kind != "image" || resource.State != types.ResourceStateActive {
+		return false, nil
+	}
+	lookup, ok := s.repo.(interface {
+		IsKnowledgeChunkImage(context.Context, uint64, string, string, string, string) (bool, error)
+	})
+	if !ok {
+		return false, fmt.Errorf("resource repository does not support chunk image authorization")
+	}
+	return lookup.IsKnowledgeChunkImage(ctx, tenantID, kbID, knowledgeID, chunkID, resource.ID)
+}
+
+func (s *resourceCatalog) IsExtractedImageForKnowledge(
+	ctx context.Context, tenantID uint64, kbID, knowledgeID, reference string,
+) (bool, error) {
+	_, resource, err := s.ResolvePath(ctx, reference)
+	if err != nil {
+		return false, err
+	}
+	if resource == nil || resource.TenantID != tenantID || resource.Kind != "image" || resource.State != types.ResourceStateActive {
+		return false, nil
+	}
+	lookup, ok := s.repo.(interface {
+		IsExtractedImageForKnowledge(context.Context, uint64, string, string, string) (bool, error)
+	})
+	if !ok {
+		return false, fmt.Errorf("resource repository does not support extracted image provenance")
+	}
+	return lookup.IsExtractedImageForKnowledge(ctx, tenantID, kbID, knowledgeID, resource.ID)
 }
 
 // GetMessageFileBindings resolves registered aliases before reading authoritative origins.

@@ -34,10 +34,14 @@ func (r *knowledgeRepository) UpdateKnowledgeForTransfer(ctx context.Context, be
 			Updates(map[string]any{
 				"knowledge_base_id": after.KnowledgeBaseID, "parse_status": after.ParseStatus,
 				"metadata": after.Metadata, "storage_size": after.StorageSize, "updated_at": after.UpdatedAt,
-				"enable_status": after.EnableStatus, "embedding_model_id": after.EmbeddingModelID,
-				"description":   after.Description,
-				"processed_at":  after.ProcessedAt,
-				"error_message": after.ErrorMessage,
+				"enable_status": gorm.Expr(
+					"CASE WHEN manual_disabled THEN ? WHEN parse_status = ? AND enable_status = ? AND ? = ? THEN ? ELSE ? END",
+					"disabled", types.ParseStatusCompleted, "enabled", after.ParseStatus,
+					types.ParseStatusCompleted, "enabled", after.EnableStatus),
+				"embedding_model_id": after.EmbeddingModelID,
+				"description":        after.Description,
+				"processed_at":       after.ProcessedAt,
+				"error_message":      after.ErrorMessage,
 			})
 		if result.Error != nil {
 			return result.Error

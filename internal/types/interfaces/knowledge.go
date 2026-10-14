@@ -240,6 +240,19 @@ type KnowledgeService interface {
 	SearchKnowledgeForScopes(ctx context.Context, scopes []types.KnowledgeSearchScope, keyword string, offset, limit int, fileTypes []string) ([]*types.Knowledge, bool, int64, error)
 }
 
+// KnowledgeLifecycleService exposes document lifecycle operations that need
+// atomic state transitions and exact chunk-image authorization.
+type KnowledgeLifecycleService interface {
+	SetKnowledgeEnabled(ctx context.Context, knowledgeID string, enabled bool) (*types.Knowledge, error)
+	GetKnowledgeChunkImage(ctx context.Context, knowledgeID, chunkID string, index int) (io.ReadCloser, string, error)
+}
+
+// KnowledgeEnableRepository is kept separate so lifecycle callers can depend
+// on the atomic operation without widening unrelated repository test doubles.
+type KnowledgeEnableRepository interface {
+	SetKnowledgeEnabled(ctx context.Context, tenantID uint64, id string, enabled bool) (bool, error)
+}
+
 // KnowledgeRepository defines the interface for knowledge repositories.
 type KnowledgeRepository interface {
 	CreateKnowledge(ctx context.Context, knowledge *types.Knowledge) error

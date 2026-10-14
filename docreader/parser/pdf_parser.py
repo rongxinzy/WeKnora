@@ -658,7 +658,16 @@ def _page_chars(textpage, page, raw) -> tuple:
                 continue  # off-page glyph
             if invisible and _point_in_boxes((x0 + x1) / 2, (y0 + y1) / 2, invisible):
                 continue  # covered by an invisible text object
-        chars.append({"x0": x0, "y0": y0, "x1": x1, "y1": y1, "ch": ch})
+        # Tight boxes describe ink, not character advance. A narrow glyph
+        # such as "1" leaves a visual gap inside a word; infer spaces from
+        # font bounds while retaining tight boxes for layout/visibility.
+        try:
+            loose_left, _, loose_right, _ = textpage.get_charbox(i, loose=True)
+            space_x0, space_x1 = sorted((loose_left, loose_right))
+        except Exception:
+            space_x0, space_x1 = x0, x1
+        chars.append({"x0": x0, "y0": y0, "x1": x1, "y1": y1, "ch": ch,
+                      "space_x0": space_x0, "space_x1": space_x1})
     return chars, width
 
 
@@ -780,7 +789,8 @@ def _join_line_glyphs(ln_sorted: list) -> str:
     """Join a visual line's glyphs, inferring word spaces from horizontal gaps."""
     if not ln_sorted:
         return ""
-    widths = [c["x1"] - c["x0"] for c in ln_sorted if c["x1"] > c["x0"]]
+    widths = [c.get("space_x1", c["x1"]) - c.get("space_x0", c["x0"])
+              for c in ln_sorted if c.get("space_x1", c["x1"]) > c.get("space_x0", c["x0"])]
     med_w = statistics.median(widths) if widths else 1.0
     gap_threshold = med_w * WORD_GAP_WIDTH_RATIO
 
@@ -795,7 +805,7 @@ def _join_line_glyphs(ln_sorted: list) -> str:
             if not ch.isspace() or (parts and not parts[-1].endswith(" ")):
                 parts.append(ch)
             continue
-        if cur["x0"] - prev["x1"] > gap_threshold:
+        if cur.get("space_x0", cur["x0"]) - prev.get("space_x1", prev["x1"]) > gap_threshold:
             parts.append(" ")
         parts.append(ch)
     return "".join(parts).strip()

@@ -3,6 +3,7 @@ package router
 import (
 	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -17,8 +18,93 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type knowledgeImageRouteStub struct {
+	interfaces.KnowledgeService
+	knowledge  *types.Knowledge
+	imageReads int
+}
+
+func (s *knowledgeImageRouteStub) GetKnowledgeByIDOnly(_ context.Context, id string) (*types.Knowledge, error) {
+	if s.knowledge != nil && s.knowledge.ID == id {
+		return s.knowledge, nil
+	}
+	return nil, apprepo.ErrKnowledgeNotFound
+}
+
+func (s *knowledgeImageRouteStub) GetKnowledgeChunkImage(context.Context, string, string, int) (io.ReadCloser, string, error) {
+	s.imageReads++
+	return io.NopCloser(bytes.NewReader([]byte("image"))), "image.png", nil
+}
+
+func (s *knowledgeImageRouteStub) SetKnowledgeEnabled(_ context.Context, id string, enabled bool) (*types.Knowledge, error) {
+	if s.knowledge == nil || s.knowledge.ID != id {
+		return nil, apprepo.ErrKnowledgeNotFound
+	}
+	if enabled {
+		s.knowledge.ManualDisabled = false
+		s.knowledge.EnableStatus = "enabled"
+	} else {
+		s.knowledge.ManualDisabled = true
+		s.knowledge.EnableStatus = "disabled"
+	}
+	return s.knowledge, nil
+}
+
 type downloadKnowledgeLookup struct {
 	knowledge *types.Knowledge
+}
+
+func TestKnowledgeLifecycleRoutesEnforceWriteAndTenantBoundaries(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	enabled := true
+	knowledge := &types.Knowledge{ID: "doc", KnowledgeBaseID: "kb", TenantID: 2}
+	guards := &rbacGuards{
+		cfg:              &config.Config{Tenant: &config.TenantConfig{EnableRBAC: &enabled}},
+		knowledgeService: &downloadKnowledgeLookup{knowledge: knowledge},
+		kbService:        &stubWikiKBLookup{kbs: map[string]*types.KnowledgeBase{"kb": {ID: "kb", TenantID: 2}}},
+		kbShareService:   &downloadKBShareStub{permission: types.OrgRoleViewer, source: 2},
+		knowledgeKBCreator: func(*gin.Context) (string, error) {
+			return "", middleware.ErrResourceNotFound
+		},
+	}
+	r := gin.New()
+	r.Use(middleware.ErrorHandler())
+	r.Use(func(c *gin.Context) {
+		ctx := context.WithValue(c.Request.Context(), types.TenantIDContextKey, uint64(1))
+		ctx = context.WithValue(ctx, types.TenantRoleContextKey, types.TenantRoleContributor)
+		ctx = context.WithValue(ctx, types.UserIDContextKey, "owner")
+		c.Request = c.Request.WithContext(ctx)
+		c.Set(types.TenantIDContextKey.String(), uint64(1))
+		c.Next()
+	})
+	imageService := &knowledgeImageRouteStub{knowledge: knowledge}
+	knowledgeHandler := handler.NewKnowledgeHandler(nil, imageService, nil, nil, nil, nil, nil)
+	RegisterKnowledgeRoutes(r.Group("/api/v1"), knowledgeHandler, guards)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/knowledge/doc/enable-status", bytes.NewBufferString(`{"enabled":false}`))
+	r.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusForbidden, rec.Code, "viewer cannot change lifecycle state: %s", rec.Body.String())
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/knowledge/doc/chunks/chunk/images/0", nil)
+	r.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, "tenant Viewer can read an authorized image: %s", rec.Body.String())
+	require.Equal(t, "private, no-store", rec.Header().Get("Cache-Control"))
+	require.Equal(t, 1, imageService.imageReads)
+
+	guards.knowledgeService = &downloadKnowledgeLookup{knowledge: &types.Knowledge{
+		ID: "foreign-doc", KnowledgeBaseID: "foreign-kb", TenantID: 2,
+	}}
+	guards.kbService = &stubWikiKBLookup{kbs: map[string]*types.KnowledgeBase{
+		"foreign-kb": {ID: "foreign-kb", TenantID: 2},
+	}}
+	guards.kbShareService = nil
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/knowledge/foreign-doc/chunks/chunk/images/0", nil)
+	r.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNotFound, rec.Code, "inaccessible cross-tenant resources are hidden: %s", rec.Body.String())
+	require.Equal(t, 1, imageService.imageReads, "cross-tenant request must not reach image storage")
 }
 
 func (s *downloadKnowledgeLookup) GetKnowledgeByIDOnly(_ context.Context, id string) (*types.Knowledge, error) {

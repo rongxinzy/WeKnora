@@ -71,6 +71,14 @@ func (r *resourceRepository) CreateBinding(ctx context.Context, binding *types.R
 	return r.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(binding).Error
 }
 
+func (r *resourceRepository) HasBinding(ctx context.Context, resourceID, ownerType, ownerID, relation string) (bool, error) {
+	var count int64
+	err := r.db.WithContext(ctx).Model(&types.ResourceBinding{}).
+		Where("resource_id = ? AND owner_type = ? AND owner_id = ? AND relation = ?", resourceID, ownerType, ownerID, relation).
+		Count(&count).Error
+	return count > 0, err
+}
+
 // DeleteBinding removes one owner's claim on a resource. Deleting a claim that
 // was never recorded is not an error: callers release optimistically, from a
 // content scan that cannot know which references were bound.

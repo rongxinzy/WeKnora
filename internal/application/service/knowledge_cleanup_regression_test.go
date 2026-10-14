@@ -109,6 +109,20 @@ func TestCleanupStopsBeforeSideEffectsWhenKBUnavailable(t *testing.T) {
 	}
 }
 
+func TestCleanupPreservesChunksWhenImageReferencesCannotBeRead(t *testing.T) {
+	f := newDocumentWriteFixture(t)
+	f.chunkRepo.imageErr = errors.New("image-info query failed")
+	row, err := f.repo.GetKnowledgeByID(f.ctx, 7, "doc")
+	require.NoError(t, err)
+
+	err = f.svc.cleanupKnowledgeResources(f.ctx, row)
+	require.ErrorContains(t, err, "image-info query failed")
+	require.Zero(t, f.chunkRepo.writes, "chunk rows must be retained for retry")
+	require.Zero(t, f.graph.calls, "cleanup stops before downstream destructive work")
+	require.Empty(t, f.files.deleted)
+	require.Empty(t, f.tenants.adjustments)
+}
+
 func TestMoveReparseKBLookupFailurePreservesSourceCheckpoint(t *testing.T) {
 	f := transferFixture(t, access.KBTransferMove)
 	row, err := f.repo.GetKnowledgeByID(f.ctx, 7, "doc")

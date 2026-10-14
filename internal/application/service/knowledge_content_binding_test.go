@@ -66,10 +66,9 @@ func contentRef(char string) string {
 	return types.BuildResourcePath(strings.Repeat(char, types.ResourceHandleLength))
 }
 
-// Saving a chat answer into the knowledge base must claim the files it shows
-// without copying them: the assistant message keeps its own claim, so either
-// side can be deleted without breaking the other.
-func TestBindContentResourcesClaimsEveryReferencedFile(t *testing.T) {
+// Caller-controlled content is never ownership evidence. Trusted parser
+// provenance is persisted through the dedicated extracted-image path instead.
+func TestBindContentResourcesDoesNotClaimCallerReferences(t *testing.T) {
 	chart := contentRef("a")
 	table := contentRef("b")
 	catalog := &resolvingCatalog{tenantByRef: map[string]uint64{chart: 7, table: 7}}
@@ -78,28 +77,14 @@ func TestBindContentResourcesClaimsEveryReferencedFile(t *testing.T) {
 	content := "## 结论\n\n![评分](" + chart + ")\n\n数据见 [表格](" + table + ")"
 	svc.bindContentResources(context.Background(), 7, "kn-1", content)
 
-	if len(catalog.binds) != 2 {
-		t.Fatalf("binds = %v, want one per reference", catalog.binds)
-	}
-	for i, want := range []string{chart, table} {
-		got := catalog.binds[i]
-		if got.ref != want {
-			t.Fatalf("binds[%d].ref = %q, want %q", i, got.ref, want)
-		}
-		if got.ownerType != types.ResourceOwnerKnowledge || got.ownerID != "kn-1" {
-			t.Fatalf("binds[%d] owner = (%q, %q), want (%q, kn-1)",
-				i, got.ownerType, got.ownerID, types.ResourceOwnerKnowledge)
-		}
-		if got.relation != types.ResourceRelationAttachment {
-			t.Fatalf("binds[%d].relation = %q, want %q",
-				i, got.relation, types.ResourceRelationAttachment)
-		}
+	if len(catalog.binds) != 0 {
+		t.Fatalf("binds = %v, caller content must not establish ownership", catalog.binds)
 	}
 }
 
 // A handle pasted from another workspace must not be claimed: binding it would
 // hand the caller a file it may not read.
-func TestBindContentResourcesSkipsForeignAndUnknownHandles(t *testing.T) {
+func TestBindContentResourcesSkipsAllCallerHandles(t *testing.T) {
 	mine := contentRef("c")
 	theirs := contentRef("d")
 	unknown := contentRef("e")
@@ -109,8 +94,8 @@ func TestBindContentResourcesSkipsForeignAndUnknownHandles(t *testing.T) {
 	content := "![a](" + mine + ") ![b](" + theirs + ") ![c](" + unknown + ")"
 	svc.bindContentResources(context.Background(), 7, "kn-1", content)
 
-	if len(catalog.binds) != 1 || catalog.binds[0].ref != mine {
-		t.Fatalf("binds = %v, want only %q", catalog.binds, mine)
+	if len(catalog.binds) != 0 {
+		t.Fatalf("binds = %v, caller content must not establish ownership", catalog.binds)
 	}
 }
 

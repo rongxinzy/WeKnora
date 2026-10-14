@@ -26,6 +26,8 @@ const (
 // files, and lets either copy be deleted without breaking the other.
 const (
 	ResourceOwnerKnowledge         = "knowledge"
+	ResourceOwnerKnowledgeImage    = "knowledge_image"
+	ResourceOwnerKnowledgeChunk    = "knowledge_chunk"
 	ResourceOwnerMessage           = "message"
 	ResourceOwnerTemporaryDocument = "temporary_document"
 )
@@ -34,6 +36,7 @@ const (
 const (
 	ResourceRelationSourceFile     = "source_file"
 	ResourceRelationExtractedImage = "extracted_image"
+	ResourceRelationChunkImage     = "image"
 	ResourceRelationArtifact       = "artifact"
 	ResourceRelationAttachment     = "attachment"
 )

@@ -1198,40 +1198,17 @@ func sanitizeManualDownloadFilename(title string) string {
 	return safeName
 }
 
-// bindContentResources claims every stored file the body references on behalf
-// of a knowledge entry.
-//
-// A manual document routinely points at files it did not upload: an answer saved
-// from a chat carries the very `resource://` handles the assistant message still
-// shows. Claiming them is what makes that copy safe — no bytes are duplicated,
-// and neither the message nor the document can delete a file the other still
-// needs. Handles belonging to another workspace are skipped, so a pasted
-// reference cannot pull in a file the caller may not read.
-//
-// Best-effort by design: the document is already saved, and a missed claim
-// degrades to the old behaviour rather than failing the save.
+// bindContentResources intentionally does not promote body references into
+// resource ownership. A pasted handle, including one copied from chat, is not
+// provenance. Resolver-created images are bound later from StoredImages; a
+// separately authorized attachment-transfer flow can be added independently.
 func (s *knowledgeService) bindContentResources(
 	ctx context.Context, tenantID uint64, knowledgeID, content string,
 ) {
-	if s.resourceCatalog == nil || knowledgeID == "" {
-		return
-	}
-	for _, ref := range types.ScanResourceReferences(content) {
-		resource, err := s.resourceCatalog.Resolve(ctx, ref)
-		if err != nil || resource == nil {
-			logger.Warnf(ctx, "Skip binding unknown resource %s to knowledge %s: %v", ref, knowledgeID, err)
-			continue
-		}
-		if resource.TenantID != tenantID {
-			logger.Warnf(ctx, "Skip binding cross-workspace resource %s to knowledge %s", ref, knowledgeID)
-			continue
-		}
-		if err := s.resourceCatalog.Bind(
-			ctx, ref, types.ResourceOwnerKnowledge, knowledgeID, types.ResourceRelationAttachment,
-		); err != nil {
-			logger.Warnf(ctx, "Failed to bind resource %s to knowledge %s: %v", ref, knowledgeID, err)
-		}
-	}
+	_ = ctx
+	_ = tenantID
+	_ = knowledgeID
+	_ = content
 }
 
 func (s *knowledgeService) triggerManualProcessing(ctx context.Context,

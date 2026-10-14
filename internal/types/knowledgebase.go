@@ -758,7 +758,6 @@ func (kb *KnowledgeBase) EnsureDefaults() {
 				IndexMode:         FAQIndexModeQuestionAnswer,
 				QuestionIndexMode: FAQQuestionIndexModeCombined,
 			}
-			return
 		}
 		if kb.FAQConfig.IndexMode == "" {
 			kb.FAQConfig.IndexMode = FAQIndexModeQuestionAnswer

@@ -37,6 +37,30 @@ def _make_image_only_pdf(num_pages: int = 2) -> bytes:
 
 
 class ClassifyPageTest(unittest.TestCase):
+    def test_real_pdf_preserves_identifiers_and_explicit_word_spaces(self):
+        # Helvetica's tight ink bounds for 1/i/l are narrower than their
+        # advance. The real PDFium path must not invent spaces inside IDs.
+        text = "Invoice 1234567890 native-pdf-1234-abcd-1234 fill ill 1 234"
+        stream = f"BT /F1 10 Tf 40 750 Td ({text}) Tj ET"
+        objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            f"<< /Length {len(stream.encode())} >>\nstream\n{stream}\nendstream",
+        ]
+        pdf = "%PDF-1.4\n"
+        offsets = []
+        for index, obj in enumerate(objects, 1):
+            offsets.append(len(pdf.encode()))
+            pdf += f"{index} 0 obj\n{obj}\nendobj\n"
+        xref = len(pdf.encode())
+        pdf += "xref\n0 6\n0000000000 65535 f \n"
+        pdf += "".join(f"{offset:010d} 00000 n \n" for offset in offsets)
+        pdf += f"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+        parsed = PDFParser(file_name="synthetic.pdf", file_type="pdf").parse_into_text(pdf.encode())
+        self.assertIn(text, parsed.content)
+
     def test_full_page_image_is_scanned_even_with_text(self):
         # Scanned newspaper: image covers the page, embedded OCR text exists.
         self.assertEqual(_classify_page(2.0, 1620), "scanned")

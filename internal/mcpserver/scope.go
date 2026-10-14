@@ -10,6 +10,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/application/access"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/mark3labs/mcp-go/mcp"
 )
 
 // allowedKnowledgeBases returns every knowledge base the endpoint may touch,
@@ -166,6 +167,34 @@ func knowledgeBaseIDs(kbs []*types.KnowledgeBase) []string {
 		ids = append(ids, kb.ID)
 	}
 	return ids
+}
+
+// portalScopeKnowledgeBases intersects the endpoint's own KB scope with the
+// current Portal session's employee/user/team grants. A nil result from the
+// callback means the feature is deliberately unconfigured (legacy MCP mode);
+// configured-but-unavailable authorization always returns an error.
+func (s *Server) portalScopeKnowledgeBases(ctx context.Context, req mcp.CallToolRequest, kbs []*types.KnowledgeBase, requireAll bool) ([]*types.KnowledgeBase, error) {
+	ids := knowledgeBaseIDs(kbs)
+	authorized, err := s.portalAuthorizedKnowledgeBases(ctx, req, ids, requireAll)
+	if err != nil {
+		return nil, err
+	}
+	if authorized == nil {
+		return kbs, nil
+	}
+	byID := make(map[string]*types.KnowledgeBase, len(kbs))
+	for _, kb := range kbs {
+		byID[kb.ID] = kb
+	}
+	result := make([]*types.KnowledgeBase, 0, len(authorized))
+	for _, id := range authorized {
+		kb := byID[id]
+		if kb == nil {
+			return nil, errors.New("online knowledge authorization returned an unknown knowledge base")
+		}
+		result = append(result, kb)
+	}
+	return result, nil
 }
 
 // retrievableKnowledgeBases keeps knowledge bases that have a vector or

@@ -28,6 +28,8 @@ func wikiSearchTool() mcp.Tool {
 			"expression; omit for the default behaviour")),
 		mcp.WithArray("knowledge_base_ids", mcp.WithStringItems(),
 			mcp.Description("Optional knowledge base ids or names to restrict the search")),
+		mcp.WithString("knowledge_context_handle", mcp.Description("Portal-issued session capability; supplied only by the governed runtime")),
+		mcp.WithString("knowledge_employee_name", mcp.Description("Server-selected employee name; supplied only by the governed runtime")),
 		mcp.WithNumber("limit", mcp.Description("Maximum pages to return, default 10, max 50")),
 		mcp.WithReadOnlyHintAnnotation(true),
 	)
@@ -40,6 +42,8 @@ func wikiReadPageTool() mcp.Tool {
 			"concept/rag")),
 		mcp.WithString("knowledge_base_id", mcp.Description("Knowledge base id or name, required only when the same "+
 			"slug exists in several wikis")),
+		mcp.WithString("knowledge_context_handle", mcp.Description("Portal-issued session capability; supplied only by the governed runtime")),
+		mcp.WithString("knowledge_employee_name", mcp.Description("Server-selected employee name; supplied only by the governed runtime")),
 		mcp.WithReadOnlyHintAnnotation(true),
 	)
 }
@@ -50,6 +54,8 @@ func wikiIndexTool() mcp.Tool {
 			"grouped by type (summary, entity, concept, ...)."),
 		mcp.WithString("knowledge_base_id", mcp.Required(), mcp.Description("Knowledge base id or exact name")),
 		mcp.WithNumber("limit", mcp.Description("Maximum entries per page type, default 50, max 200")),
+		mcp.WithString("knowledge_context_handle", mcp.Description("Portal-issued session capability; supplied only by the governed runtime")),
+		mcp.WithString("knowledge_employee_name", mcp.Description("Server-selected employee name; supplied only by the governed runtime")),
 		mcp.WithReadOnlyHintAnnotation(true),
 	)
 }
@@ -84,9 +90,18 @@ func (s *Server) handleWikiSearch(ctx context.Context, req mcp.CallToolRequest) 
 	if err != nil || strings.TrimSpace(query) == "" {
 		return mcp.NewToolResultError("query is required"), nil
 	}
-	kbs, err := s.wikiScopeFromRequest(ctx, ep, req.GetStringSlice("knowledge_base_ids", nil))
+	requested := req.GetStringSlice("knowledge_base_ids", nil)
+	kbs, err := s.wikiScopeFromRequest(ctx, ep, requested)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
+	}
+	kbs, err = s.portalScopeKnowledgeBases(ctx, req, kbs, len(requested) > 0)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	kbs = wikiKnowledgeBases(kbs)
+	if len(kbs) == 0 {
+		return mcp.NewToolResultError(errNoWikiInScope.Error()), nil
 	}
 	limit := req.GetInt("limit", defaultWikiSearchLimit)
 	if limit < 1 {
@@ -127,6 +142,15 @@ func (s *Server) handleWikiReadPage(ctx context.Context, req mcp.CallToolRequest
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	strict := strings.TrimSpace(req.GetString("knowledge_base_id", "")) != ""
+	kbs, err = s.portalScopeKnowledgeBases(ctx, req, kbs, strict)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	kbs = wikiKnowledgeBases(kbs)
+	if len(kbs) == 0 {
+		return mcp.NewToolResultError(errNoWikiInScope.Error()), nil
+	}
 	tool := tools.NewWikiReadPageTool(
 		s.wikiService, s.knowledgeService, wikiScopesFor(kbs), tools.NewWikiRouteResolver(),
 	)
@@ -147,6 +171,10 @@ func (s *Server) handleWikiIndex(ctx context.Context, req mcp.CallToolRequest) (
 	kbs, err := s.wikiScopeFromRequest(ctx, ep, []string{selector})
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
+	}
+	kbs, err = s.portalScopeKnowledgeBases(ctx, req, kbs, true)
+	if err != nil || len(kbs) != 1 {
+		return mcp.NewToolResultError("knowledge access denied"), nil
 	}
 	limit := req.GetInt("limit", defaultWikiIndexLimit)
 	if limit < 1 {
