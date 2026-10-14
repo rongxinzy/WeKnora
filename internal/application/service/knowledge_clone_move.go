@@ -990,6 +990,9 @@ func (s *knowledgeService) getOrCreateFAQKnowledge(ctx context.Context, kb *type
 		knowledge.Description = srcKnowledge.Description
 		knowledge.Source = srcKnowledge.Source
 		knowledge.Channel = srcKnowledge.Channel
+		// Same as document clones: keep an explicitly disabled FAQ container disabled.
+		knowledge.ManualDisabled = srcKnowledge.ManualDisabled
+		knowledge.EnableStatus = srcKnowledge.EnableStatus
 		fields := map[string]json.RawMessage{}
 		if len(srcKnowledge.Metadata) > 0 {
 			if err := json.Unmarshal(srcKnowledge.Metadata, &fields); err != nil {

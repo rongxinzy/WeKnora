@@ -48,17 +48,21 @@ func (s *knowledgeService) cloneKnowledge(
 		return err
 	}
 	dst := &types.Knowledge{
-		ID:               uuid.NewString(),
-		TenantID:         targetKB.TenantID,
-		KnowledgeBaseID:  targetKB.ID,
-		Type:             src.Type,
-		Channel:          src.Channel,
-		Title:            src.Title,
-		Description:      src.Description,
-		Profile:          src.Profile.Clone(),
-		Source:           src.Source,
-		ParseStatus:      "processing",
-		EnableStatus:     "disabled",
+		ID:              uuid.NewString(),
+		TenantID:        targetKB.TenantID,
+		KnowledgeBaseID: targetKB.ID,
+		Type:            src.Type,
+		Channel:         src.Channel,
+		Title:           src.Title,
+		Description:     src.Description,
+		Profile:         src.Profile.Clone(),
+		Source:          src.Source,
+		ParseStatus:     "processing",
+		EnableStatus:    "disabled",
+		// Carry the source's explicit disable intent: the clone finishes parsing as
+		// enabled unless this is set, which would turn a disabled document back into
+		// a retrievable one.
+		ManualDisabled:   src.ManualDisabled,
 		EmbeddingModelID: targetKB.EmbeddingModelID,
 		FileName:         src.FileName,
 		FolderPath:       src.FolderPath,
